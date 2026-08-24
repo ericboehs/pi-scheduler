@@ -153,6 +153,13 @@ function describeMisfire(task: DurableTask): string {
 /**
  * Management verbs and the shape each expects. Used only to explain a mistyped
  * one; the matchers above remain the source of truth for what is accepted.
+ *
+ * Also load-bearing for `test/invariants.test.mjs`, which reads it as the list
+ * of verbs `/schedule` implements and fails if the CLI grows a command that is
+ * not here and not explicitly shell-only. Adding a verb without a usage string
+ * will trip that test — which is the point, so add the string rather than the
+ * exemption. Creation is not a verb and so is not listed; the test matches it
+ * against the bare-spec branch instead.
  */
 const SUBCOMMAND_SHAPES: Record<string, string> = {
   list: "list [all]",

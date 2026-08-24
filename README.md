@@ -14,7 +14,11 @@ implementation.
 | Missed fires | dropped | caught up once, within a grace window |
 
 **Neither extension registers an LLM tool or adds anything to model context.**
-Nothing stays resident, and interactive pi startup is untouched.
+The durable half stays out of pi entirely between runs: a launchd/systemd tick
+owns the schedule, so nothing is resident and pi's startup path is untouched.
+Session timers (`/once`, `/loop`) are necessarily in-process — they hold
+`setTimeout`s for the life of the session and read their snapshot back at
+`session_start` — but they still register no tool and no context.
 
 ## Install
 
@@ -105,20 +109,29 @@ expanded into filenames before the scheduler ever sees it.
 ### Nothing stays resident
 
 A launchd job (or systemd `--user` timer on Linux) runs `pi-scheduler check`
-every 60s; it reads one JSON file and exits, measured at ~73ms when nothing is
-due. pi is only spawned when a task is actually due.
+every 60s; it reads one JSON file and exits when nothing is due. pi is only
+spawned when a task is actually due.
 
 The launchd label is `com.ericboehs.pi-scheduler`; the systemd unit is
-`pi-scheduler.timer`. On Linux, `Persistent=true` means a laptop suspended over
-the scheduled minute still gets its tick, and user timers stop when your last
-session ends unless you `sudo loginctl enable-linger <user>`.
+`pi-scheduler.timer`. Neither tick catches up on its own after a suspend —
+launchd fires on wake and the systemd timer simply resumes its interval — so
+catching up a slot that passed while the machine was asleep is the misfire
+policy's job, which works identically on both. On Linux, user timers stop when
+your last session ends unless you `sudo loginctl enable-linger <user>`.
+
+The installed unit captures `PATH`, `HOME`, and `PI_SCHEDULER_DIR` /
+`PI_AGENT_DIR` if you have them set, because launchd and systemd start jobs
+with a bare environment. Reinstall after moving node, pi or mise, or after
+changing where the registry lives.
 
 ### What a scheduled run loads
 
 Each run is a fresh `pi -p` that loads **what an interactive pi would**: your
 extensions, skills, prompt templates, and the `AGENTS.md` of the directory the
-task was created in. A task records its cwd at creation, so project context is
-the context you had in mind when you wrote the prompt. That means the prompt
+task was created in — subject to pi's own project-trust policy, so a task in a
+directory you have never trusted will skip its extensions, skills and
+templates. A task records its cwd at creation, so project context is the
+context you had in mind when you wrote the prompt. That means the prompt
 can simply be a slash command:
 
 ```sh
@@ -126,9 +139,16 @@ cd ~/Code/some/repo
 pi-scheduler add --name checkin daily 9a :: /checkin
 ```
 
-Full discovery costs about 0.3s more at startup than a stripped one, which is
+Full discovery costs a little more at startup than a stripped run, which is
 nothing for something that runs once a day, and the alternative — a scheduled
 run that behaves unlike the pi you tested the prompt in — is a worse trade.
+
+**If the recorded directory no longer exists, the run falls back to `$HOME`**
+rather than failing — a moved project should not silently stop a daily task.
+That does mean a tool-enabled prompt written for one repo can end up running
+against your home directory, so `pi-scheduler show <task>` after moving things
+is worth the two seconds. A directory that still exists but cannot be entered
+is an error, not a fallback.
 
 `--without` strips pieces back out: `extensions`, `skills`, `templates`,
 `context`, `tools`. `--without tools` makes a run answer-only, worth doing for
@@ -173,6 +193,18 @@ Read-modify-write goes through a `mkdir` mutex held only for the JSON round
 trip; the agent run itself happens outside the lock, guarded instead by a claim
 recorded on the task, so two overlapping ticks cannot double-run one job and a
 runner that dies has its claim reclaimed rather than wedging the task forever.
+
+A claim is reclaimed either when the runner's process is gone (checked with
+signal 0) or when it has outlived `--timeout` by six hours, whichever comes
+first. The pid check only applies to claims this machine wrote — the claim
+records its hostname, because a pid from another machine says nothing here.
+
+**The registry assumes one machine.** Pointing two computers at one
+`PI_SCHEDULER_DIR` on a synced or network volume is not supported: the lock
+serialises writes to the JSON, but nothing stops both hosts deciding a task is
+due and running the prompt twice. The hostname on the claim keeps the pid check
+from making that *worse*; it does not make the arrangement work. Give each
+machine its own directory.
 
 ## Cron syntax
 

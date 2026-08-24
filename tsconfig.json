@@ -9,14 +9,14 @@
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
     "skipLibCheck": true,
-    // pi loads .ts extensions through Node's type stripping, which only erases
-    // types — it cannot emit code. This flag rejects the syntax that would
-    // otherwise blow up at load time (parameter properties, enums, namespaces).
-    // bin/pi-scheduler imports these same modules under Node's strip-only mode,
-    // which is stricter still, so this is load-bearing rather than style.
+    // These modules are loaded two different ways, and the strictest wins.
+    // pi transpiles extensions through jiti; bin/pi-scheduler imports the same
+    // files under Node's strip-only type stripping, which only erases types and
+    // cannot emit code. This flag rejects the syntax that would blow up there
+    // (parameter properties, enums, namespaces), so it is load-bearing.
     "erasableSyntaxOnly": true,
-    // ...and the same loader resolves import specifiers literally, so one
-    // module importing another writes "./schedule-core.ts".
+    // Node's loader also resolves import specifiers literally, so one module
+    // importing another writes "./schedule-core.ts".
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true
   },
