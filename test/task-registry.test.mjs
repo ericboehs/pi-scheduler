@@ -394,6 +394,7 @@ test("a task summarizes as one scannable line", () => {
   assert.match(formatTask(task({ paused: true }), now), /paused/);
   assert.match(formatTask(task({ runningSince: now - 5_000 }), now), /running for 5s/);
 });
+
 test("a history write failure still clears the claim and retires a one-shot", (t) => {
   const dir = withTempDir(t);
   // A regular file where runs/ should be, so every append fails with ENOTDIR.

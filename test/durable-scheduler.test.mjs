@@ -425,18 +425,13 @@ test("/schedule help says where run actually runs, which is the ambiguous part",
 });
 
 test("/schedule run returns immediately rather than blocking the conversation", async (t) => {
-  withTempDir(t);
+  const dir = withTempDir(t);
   const ui = mount();
   await ui.run("--name slow daily 9a :: x");
 
-  // Point the runner at something that takes a while. If run() awaited it, the
-  // handler below would not come back for a second.
-  const previous = process.env.PI_SCHEDULER_PI_BIN;
-  process.env.PI_SCHEDULER_PI_BIN = "/bin/sleep";
-  t.after(() => {
-    if (previous === undefined) delete process.env.PI_SCHEDULER_PI_BIN;
-    else process.env.PI_SCHEDULER_PI_BIN = previous;
-  });
+  // A pi that genuinely blocks. If run() awaited it, the handler below would
+  // not come back until release() — which never happens before the assertion.
+  fakePi(t, dir);
 
   const startedAt = Date.now();
   await ui.run("run slow");
@@ -452,19 +447,19 @@ test("/schedule run returns immediately rather than blocking the conversation", 
 });
 
 test("/schedule run claims the task, so the next tick cannot double-run it", async (t) => {
-  withTempDir(t);
+  const dir = withTempDir(t);
   const ui = mount();
   await ui.run("--name once-only daily 9a :: x");
 
-  const previous = process.env.PI_SCHEDULER_PI_BIN;
-  process.env.PI_SCHEDULER_PI_BIN = "/bin/sleep";
-  t.after(() => {
-    if (previous === undefined) delete process.env.PI_SCHEDULER_PI_BIN;
-    else process.env.PI_SCHEDULER_PI_BIN = previous;
-  });
+  // The claim must outlive the assertion, so the child has to still be running
+  // when it is made. With a fake pi that exits immediately this would race
+  // settlement and pass for the wrong reason.
+  fakePi(t, dir);
 
   await ui.run("run once-only");
-  assert.ok(readRegistry().tasks[0].runningSince > 0, "claimed before the run starts");
+  const claimed = readRegistry().tasks[0];
+  assert.ok(claimed.runningSince > 0, "claimed before the run starts");
+  assert.equal(claimed.runnerPid, process.pid, "the claim names its owner");
 
   await ui.run("run once-only");
   assert.equal(ui.last().level, "error");
@@ -472,7 +467,7 @@ test("/schedule run claims the task, so the next tick cannot double-run it", asy
 });
 
 test("run and runs are different commands, and neither shadows the other", async (t) => {
-  withTempDir(t);
+  const dir = withTempDir(t);
   const ui = mount();
   await ui.run("--name grades daily 9a :: x");
 
@@ -482,12 +477,7 @@ test("run and runs are different commands, and neither shadows the other", async
   assert.match(ui.last().message, /No runs recorded yet/);
   assert.equal(readRegistry().tasks[0].runningSince, undefined, "history is read-only");
 
-  const previous = process.env.PI_SCHEDULER_PI_BIN;
-  process.env.PI_SCHEDULER_PI_BIN = "/bin/sleep";
-  t.after(() => {
-    if (previous === undefined) delete process.env.PI_SCHEDULER_PI_BIN;
-    else process.env.PI_SCHEDULER_PI_BIN = previous;
-  });
+  fakePi(t, dir);
 
   await ui.run("run grades");
   assert.match(ui.last().message, /Running grades/);
@@ -664,6 +654,7 @@ test("a child that never reads stdin fails the run instead of crashing the tick"
   const outcome = await runTask(task, { timeoutMs: 30_000 });
   assert.equal(outcome.status, "error", "a child that exits nonzero is a failed run");
 });
+
 test("/schedule run takes over a claim whose runner died, like the CLI does", async (t) => {
   const dir = withTempDir(t);
   const ui = mount();
