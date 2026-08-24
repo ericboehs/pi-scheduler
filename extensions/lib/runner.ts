@@ -15,7 +15,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
 
 import {
@@ -34,6 +34,7 @@ export interface RunOutcome {
 }
 
 const MAX_CAPTURED_OUTPUT = 200_000;
+const DELIVERY_TIMEOUT_MS = 120_000;
 
 export function piArgsFor(task: DurableTask): string[] {
   const enabled = enabledFeatures(task);
@@ -55,6 +56,9 @@ interface CaptureResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  truncated: boolean;
+  /** A write to the child's stdin failed, so `input` may be only partly there. */
+  stdinError?: Error;
 }
 
 function capture(
@@ -67,48 +71,123 @@ function capture(
       cwd: options.cwd,
       env: options.env,
       stdio: ["pipe", "pipe", "pipe"],
+      // Its own process group, so a timeout can kill the whole tree. A prompt
+      // that shells out, or a `deliver` one-liner with a pipeline in it, leaves
+      // grandchildren holding the stdio pipes: signalling only the direct child
+      // leaves 'close' waiting on them long past the deadline.
+      detached: true,
     });
 
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let truncated = false;
+    let settled = false;
+    let stdinError: Error | undefined;
+    let hardTimer: ReturnType<typeof setTimeout> | undefined;
+    let giveUpTimer: ReturnType<typeof setTimeout> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
-    const timer = setTimeout(() => {
+    /**
+     * Cancel the timeout and the kill escalation.
+     *
+     * Not housekeeping: a child that dies promptly on SIGTERM would otherwise
+     * be followed five seconds later by `kill(-pid, SIGKILL)` against a pid the
+     * OS may have handed to something else. `unref` hides this in the CLI, but
+     * an in-process `/schedule run` keeps the loop alive long enough to fire.
+     */
+    const stopTimers = () => {
+      if (timer) clearTimeout(timer);
+      if (hardTimer) clearTimeout(hardTimer);
+      if (giveUpTimer) clearTimeout(giveUpTimer);
+      timer = undefined;
+      hardTimer = undefined;
+      giveUpTimer = undefined;
+    };
+
+    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (settled) return;
+      settled = true;
+      stopTimers();
+      resolve({ code, signal, stdout, stderr, timedOut, truncated, stdinError });
+    };
+
+    const signalTree = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, signal);
+      } catch {
+        // The group is already gone, or this platform refused it.
+        child.kill(signal);
+      }
+    };
+
+    timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
+      signalTree("SIGTERM");
       // A wedged model call ignores SIGTERM; do not let a stuck run hold its
-      // claim until CLAIM_STALE_MS expires.
-      setTimeout(() => child.kill("SIGKILL"), 5_000).unref?.();
+      // claim until CLAIM_STALE_MS expires. If even SIGKILL leaves something
+      // holding the pipes, give up waiting and report what we have.
+      hardTimer = setTimeout(() => {
+        signalTree("SIGKILL");
+        giveUpTimer = setTimeout(() => finish(null, "SIGKILL"), 1_000);
+        giveUpTimer.unref?.();
+      }, 5_000);
+      hardTimer.unref?.();
     }, options.timeoutMs);
     timer.unref?.();
 
     child.stdout.on("data", (chunk: Buffer) => {
       if (stdout.length < MAX_CAPTURED_OUTPUT) stdout += chunk.toString();
+      else truncated = true;
     });
     child.stderr.on("data", (chunk: Buffer) => {
       if (stderr.length < MAX_CAPTURED_OUTPUT) stderr += chunk.toString();
     });
     child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+      stopTimers();
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
     });
     child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code, signal, stdout, stderr, timedOut });
+      finish(code, signal);
     });
 
     // A child that exits, or never reads stdin, makes this write fail with
     // EPIPE. An unhandled 'error' on the stream would take down the whole
     // process — for the tick, that means one misbehaving task killing the run
-    // of every other due task. The child's exit code is the real signal, and
-    // 'close' below still resolves with it, so this is deliberately swallowed.
-    // `deliver` commands hit the same path: plenty of shell one-liners never
-    // read their stdin.
-    child.stdin.on("error", () => {});
+    // of every other due task. So it is recorded rather than thrown, and the
+    // caller decides: a `deliver` one-liner that ignores stdin is fine, a pi
+    // run that never received its prompt is not.
+    child.stdin.on("error", (error: Error) => {
+      stdinError ??= error;
+    });
 
     if (options.input !== undefined) child.stdin.end(options.input);
     else child.stdin.end();
   });
+}
+
+/**
+ * The directory the run should happen in.
+ *
+ * A task records the directory it was created in, so project extensions and
+ * AGENTS.md resolve the way they did when the prompt was written. A directory
+ * that has since been deleted falls back to $HOME; one that exists but cannot
+ * be used is an error, because running a tool-enabled prompt against the wrong
+ * project and reporting success is worse than not running it.
+ */
+function resolveCwd(task: DurableTask): { cwd: string } | { error: string } {
+  if (!task.cwd) return { cwd: homedir() };
+  try {
+    if (!statSync(task.cwd).isDirectory()) return { error: `cwd ${task.cwd} is not a directory` };
+    return { cwd: task.cwd };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { cwd: homedir() };
+    return { error: `cannot use cwd ${task.cwd}: ${code ?? String(error)}` };
+  }
 }
 
 /**
@@ -119,14 +198,13 @@ function capture(
  */
 export async function runTask(
   task: DurableTask,
-  options: { piBin?: string; env?: NodeJS.ProcessEnv } = {},
+  options: { piBin?: string; env?: NodeJS.ProcessEnv; deliveryTimeoutMs?: number } = {},
 ): Promise<RunOutcome> {
   const piBin = options.piBin ?? process.env.PI_SCHEDULER_PI_BIN ?? "pi";
   const env = options.env ?? process.env;
-  // A task records the directory it was created in, so project extensions and
-  // AGENTS.md resolve the way they did when the prompt was written. $HOME is
-  // only the fallback for a task whose directory has since gone away.
-  const cwd = existsSync(task.cwd ?? "") ? (task.cwd as string) : homedir();
+  const resolved = resolveCwd(task);
+  if ("error" in resolved) return { status: "error", output: "", error: resolved.error };
+  const cwd = resolved.cwd;
   const timeoutMs = task.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   let result: CaptureResult;
@@ -145,9 +223,22 @@ export async function runTask(
     };
   }
 
-  const output = result.stdout.trim();
+  const output = result.truncated
+    ? `${result.stdout.trim()}\n\n… output truncated at ${MAX_CAPTURED_OUTPUT} characters`
+    : result.stdout.trim();
   if (result.timedOut) {
     return { status: "timeout", output, error: `no result within ${timeoutMs}ms` };
+  }
+  // The prompt goes in on stdin, so a broken pipe means pi may have run on a
+  // partial prompt — or none at all. Reporting that as success would hand back
+  // an answer to a question that was never fully asked.
+  if (result.stdinError) {
+    return {
+      status: "error",
+      exitCode: result.code ?? undefined,
+      output,
+      error: `could not send the prompt to ${piBin}: ${result.stdinError.message}`,
+    };
   }
   if (result.code !== 0) {
     return {
@@ -163,13 +254,14 @@ export async function runTask(
   // Empty output is a successful no-op, not something to page about.
   if (!output) return { status: "ok", exitCode: 0, output };
 
+  const deliveryTimeoutMs = options.deliveryTimeoutMs ?? DELIVERY_TIMEOUT_MS;
   let delivery: CaptureResult;
   try {
     delivery = await capture("/bin/sh", ["-c", task.deliver], {
       cwd,
       env: { ...env, PI_SCHEDULER_OUTPUT: output, PI_SCHEDULER_TASK: task.name ?? task.id },
       input: output,
-      timeoutMs: 120_000,
+      timeoutMs: deliveryTimeoutMs,
     });
   } catch (error) {
     return {
@@ -179,7 +271,14 @@ export async function runTask(
     };
   }
 
-  if (delivery.timedOut || delivery.code !== 0) {
+  if (delivery.timedOut) {
+    return {
+      status: "error",
+      output,
+      error: `deliver did not finish within ${deliveryTimeoutMs}ms and was killed`,
+    };
+  }
+  if (delivery.code !== 0) {
     return {
       status: "error",
       exitCode: delivery.code ?? undefined,
