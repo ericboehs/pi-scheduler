@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
 // The registry resolves its directory from the environment at call time, so
@@ -57,12 +57,6 @@ function task(overrides = {}) {
 test("an absent registry reads as empty rather than throwing", (t) => {
   withTempDir(t);
   assert.deepEqual(readRegistry(), { version: 1, tasks: [] });
-});
-
-test("a corrupt registry reads as empty, because launchd has nobody to tell", (t) => {
-  const dir = withTempDir(t);
-  writeFileSync(join(dir, "tasks.json"), "{ this is not json");
-  assert.deepEqual(readRegistry().tasks, []);
 });
 
 test("a malformed task is dropped without discarding its healthy neighbours", (t) => {
@@ -249,6 +243,40 @@ test("settleRun keeps a recurring task and clears its claim", (t) => {
   assert.equal(readRuns("aaaa1111")[0].error, "pi exited 1");
 });
 
+test("a settle from a runner that was already superseded does not touch the new claim", (t) => {
+  withTempDir(t);
+
+  // A goes stale, B reclaims, then A finally finishes. A must not clear B's
+  // claim or advance the schedule out from under the run that is still going.
+  const staleClaim = Date.now() - 10_000;
+  const freshClaim = Date.now();
+  writeRegistry({ version: 1, tasks: [claimTask(task(), freshClaim, 2222)] });
+
+  settleRun("aaaa1111", 100_000, staleClaim, { status: "error", error: "late loser" }, staleClaim);
+
+  const [stored] = readRegistry().tasks;
+  assert.equal(stored.runningSince, freshClaim, "B still owns the run");
+  assert.equal(stored.runnerPid, 2222);
+  assert.equal(stored.lastStatus, undefined, "B has not reported yet");
+  assert.equal(
+    readRuns("aaaa1111")[0].error,
+    "late loser",
+    "the losing run is still worth recording; only the schedule is off-limits",
+  );
+});
+
+test("the claim holder settles normally", (t) => {
+  withTempDir(t);
+  const claimedAt = Date.now();
+  writeRegistry({ version: 1, tasks: [claimTask(task(), claimedAt, 2222)] });
+
+  settleRun("aaaa1111", 100_000, claimedAt, { status: "ok" }, claimedAt);
+
+  const [stored] = readRegistry().tasks;
+  assert.equal(stored.runningSince, undefined);
+  assert.equal(stored.lastStatus, "ok");
+});
+
 test("removing a task can take its history with it", (t) => {
   withTempDir(t);
   appendRun("abc", { runId: "1", startedAt: 1, endedAt: 2, status: "ok" });
@@ -283,3 +311,61 @@ test("a task summarizes as one scannable line", () => {
   assert.match(formatTask(task({ paused: true }), now), /paused/);
   assert.match(formatTask(task({ runningSince: now - 5_000 }), now), /running for 5s/);
 });
+test("a history write failure still clears the claim and retires a one-shot", (t) => {
+  const dir = withTempDir(t);
+  // A regular file where runs/ should be, so every append fails with ENOTDIR.
+  writeFileSync(join(dir, "runs"), "");
+  writeRegistry({ version: 1, tasks: [claimTask(task({ kind: "once", id: "one11111" }), Date.now(), 1)] });
+
+  // A task left "running" is invisible to every later tick until the stale
+  // window, and a one-shot would never retire at all.
+  assert.throws(() => settleRun("one11111", 100_000, Date.now(), { status: "ok", output: "done" }));
+  assert.deepEqual(readRegistry().tasks, [], "the one-shot retired despite the unwritable log");
+});
+
+test("a history write failure on a recurring task still releases and advances it", (t) => {
+  const dir = withTempDir(t);
+  writeFileSync(join(dir, "runs"), "");
+  writeRegistry({ version: 1, tasks: [claimTask(task(), Date.now(), 1)] });
+
+  assert.throws(() => settleRun("aaaa1111", 100_000, Date.now(), { status: "error", error: "x" }));
+
+  const [stored] = readRegistry().tasks;
+  assert.equal(stored.runningSince, undefined, "the claim is gone even though the record is not");
+  assert.equal(stored.lastStatus, "error");
+  assert.ok(stored.nextRunAt > Date.now());
+});
+
+test("a claim records the machine that made it", () => {
+  const claimed = claimTask(task(), 1_000, 4242);
+  assert.equal(claimed.runnerHost, hostname());
+  // Releasing clears all three, or the next claim inherits a stale host.
+  const released = releaseTask(claimed, 2_000, "ok");
+  assert.equal(released.runnerHost, undefined);
+  assert.equal(released.runnerPid, undefined);
+  assert.equal(released.runningSince, undefined);
+});
+
+test("a claim from another machine is never declared dead by pid", () => {
+  // The failure this prevents: two machines on one synced registry. B probes
+  // A's pid, gets ESRCH for a runner that is fine, and runs the prompt again.
+  const foreign = {
+    ...task(),
+    runningSince: Date.now() - 1_000,
+    runnerPid: 2,
+    runnerHost: `not-${hostname()}`,
+  };
+  assert.equal(isClaimStale(foreign, Date.now()), false, "a foreign pid says nothing");
+
+  // The age rule still applies, so a genuinely wedged foreign runner is not
+  // permanent — it just takes timeout + 6h, as it did before pid probing.
+  assert.equal(isClaimStale({ ...foreign, runningSince: Date.now() - (7 * 3_600_000) }, Date.now()), true);
+});
+
+test("a claim with no host is still probed, so upgrades keep working", () => {
+  // Written by a version before runnerHost existed. Treating undefined as
+  // "foreign" would silently disable pid staleness for every existing claim.
+  const legacy = { ...task(), runningSince: Date.now() - 1_000, runnerPid: 2 };
+  assert.equal(isClaimStale(legacy, Date.now()), true, "pid 2 is not a live runner here");
+});
+

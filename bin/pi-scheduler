@@ -254,7 +254,20 @@ async function commandCheck() {
       // later tick until CLAIM_STALE_MS elapses.
       outcome = { status: "error", output: "", error: error instanceof Error ? error.message : String(error) };
     }
-    settleRun(task.id, scheduledFor, startedAt, outcome);
+
+    // Settling is also fallible — a full disk, an unwritable runs/ — and every
+    // task after this one is already claimed. Letting one throw out of the loop
+    // would hide the rest until the stale window, so report and carry on.
+    try {
+      settleRun(task.id, scheduledFor, startedAt, outcome, task.runningSince);
+    } catch (error) {
+      process.exitCode = 1;
+      process.stderr.write(
+        `${new Date().toISOString()} ${task.name ?? task.id}`
+        + ` could not settle run: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+
     process.stdout.write(
       `${new Date().toISOString()} ${task.name ?? task.id} ${outcome.status}`
       + `${outcome.error ? ` — ${outcome.error}` : ""}\n`,
@@ -263,14 +276,44 @@ async function commandCheck() {
 }
 
 async function commandRun(selector) {
-  const task = findTask(readRegistry().tasks, selector);
+  // Claim first. Without this a tick firing a second later, or a second
+  // `pi-scheduler run`, would start the same prompt again and both would call
+  // settleRun — double-advancing the schedule and paying for the model twice.
+  const task = withRegistry((registry) => {
+    const existing = findTask(registry.tasks, selector);
+    if (existing.runningSince !== undefined && !isClaimStale(existing, Date.now())) {
+      die(`${existing.name ?? existing.id} is already running (pid ${existing.runnerPid})`);
+    }
+    const index = registry.tasks.indexOf(existing);
+    const claimed = claimTask(existing, Date.now(), process.pid);
+    registry.tasks[index] = claimed;
+    writeRegistry(registry);
+    return claimed;
+  });
+
   const startedAt = Date.now();
   process.stderr.write(`Running ${task.name ?? task.id}…\n`);
-  const outcome = await runTask(task);
-  settleRun(task.id, task.nextRunAt, startedAt, outcome);
+  let outcome;
+  try {
+    outcome = await runTask(task);
+  } catch (error) {
+    // Never leave a claim behind, even if the runner threw.
+    outcome = { status: "error", output: "", error: error instanceof Error ? error.message : String(error) };
+  }
+  // Print the result before anything else can fail. A settle failure must not
+  // cost the user a model result they have already paid for.
+  let settleError;
+  try {
+    settleRun(task.id, task.nextRunAt, startedAt, outcome, task.runningSince);
+  } catch (error) {
+    settleError = error instanceof Error ? error.message : String(error);
+  }
   if (outcome.output) process.stdout.write(`${outcome.output}\n`);
   if (outcome.error) process.stderr.write(`${outcome.error}\n`);
-  if (outcome.status !== "ok") process.exitCode = 1;
+  if (settleError) {
+    process.stderr.write(`pi-scheduler: could not record this run: ${settleError}\n`);
+  }
+  if (outcome.status !== "ok" || settleError) process.exitCode = 1;
 }
 
 function commandList(flags) {

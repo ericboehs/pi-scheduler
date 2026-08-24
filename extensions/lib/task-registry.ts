@@ -31,7 +31,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 
 import {
@@ -154,6 +154,14 @@ export interface DurableTask extends Schedule {
   /** Set while a runner owns this task, so overlapping minute checks do not double-run it. */
   runningSince?: number;
   runnerPid?: number;
+  /**
+   * The machine that wrote the claim.
+   *
+   * `runnerPid` is only meaningful on the host that produced it. Without this,
+   * a second machine sharing the registry probes a pid from the first, gets
+   * ESRCH for a runner that is very much alive, and runs the task again.
+   */
+  runnerHost?: string;
 }
 
 export interface Registry {
@@ -374,8 +382,41 @@ export function misfireGraceMs(task: DurableTask): number {
   return typeof policy === "number" && policy >= 0 ? policy : DEFAULT_MISFIRE_GRACE_MS;
 }
 
+/**
+ * Is the process that claimed this task gone?
+ *
+ * Signal 0 does no signalling; it just asks the kernel about the pid. ESRCH
+ * means nothing has that pid, so the claim is abandoned and can be taken over
+ * immediately rather than after the six-hour age rule. EPERM means it exists
+ * but belongs to another user, which is still "alive".
+ *
+ * Only ever used to declare a claim dead *sooner*, and only for claims this
+ * machine wrote. A pid from another host means nothing here — probing it would
+ * return ESRCH for a runner that is running fine, and two machines would
+ * execute the same prompt at once. A pid can also be reused, so a
+ * seemingly-live pid proves nothing either and falls through to the age rule.
+ */
+function runnerIsGone(task: DurableTask): boolean {
+  // Undefined has to mean "probe" or claims written before this field existed
+  // would never go stale by pid. The cost is that the first claim after an
+  // upgrade on a shared volume is unprotected; the age rule still covers it.
+  if (task.runnerHost !== undefined && task.runnerHost !== hostname()) return false;
+  const pid = task.runnerPid;
+  if (pid === undefined || !Number.isInteger(pid) || pid <= 0) return false;
+  // Our own pid is the manual-run case: obviously alive, and probing it would
+  // always say so anyway.
+  if (pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
 export function isClaimStale(task: DurableTask, now: number): boolean {
   if (task.runningSince === undefined) return false;
+  if (runnerIsGone(task)) return true;
   return now - task.runningSince > (task.timeoutMs ?? DEFAULT_TIMEOUT_MS) + CLAIM_STALE_MS;
 }
 
@@ -407,11 +448,16 @@ export function selectDue(tasks: DurableTask[], now: number): DueDecision[] {
 }
 
 /**
- * The task as it should be stored once a run for `scheduledFor` is claimed.
- * One-shots are marked so the caller can delete them after they succeed.
+ * The task as it should be stored once a run is claimed: whoever holds
+ * `runningSince`/`runnerPid` owns the run, and `selectDue` skips the task until
+ * the claim is released or goes stale. One-shots are not special here — they
+ * are retired by `settleRun` after any completed outcome, success or not.
+ *
+ * `runnerHost` is stamped alongside the pid because the pid is only meaningful
+ * on the machine that produced it.
  */
 export function claimTask(task: DurableTask, now: number, pid: number): DurableTask {
-  return { ...task, runningSince: now, runnerPid: pid };
+  return { ...task, runningSince: now, runnerPid: pid, runnerHost: hostname() };
 }
 
 /** Clear the claim and roll the schedule forward past `now`. */
@@ -428,6 +474,7 @@ export function releaseTask(
   };
   delete released.runningSince;
   delete released.runnerPid;
+  delete released.runnerHost;
   if (next === undefined) return undefined;
   return { ...released, nextRunAt: next };
 }
@@ -513,6 +560,11 @@ export interface RunOutcomeLike {
 /**
  * Record a finished run, clear its claim, and roll the schedule forward.
  *
+ * Pass `claimedAt` — the `runningSince` this runner wrote when it claimed the
+ * task — to settle only if the claim is still ours. Without it a run that went
+ * stale, was reclaimed by another runner, and then finished late would clear
+ * the new runner's claim and advance the schedule a second time.
+ *
  * One-shots have no next occurrence, so they leave the registry here. Their
  * outcome survives in the run log, which is the only place a reminder that
  * failed can still be found.
@@ -522,29 +574,43 @@ export function settleRun(
   scheduledFor: number,
   startedAt: number,
   outcome: RunOutcomeLike,
+  claimedAt?: number,
 ): void {
   const endedAt = Date.now();
-  appendRun(taskId, {
-    runId: `${startedAt}`,
-    startedAt,
-    endedAt,
-    scheduledFor,
-    status: outcome.status,
-    exitCode: outcome.exitCode,
-    error: outcome.error,
-    output: outcome.output || undefined,
-  });
+  // Recording history must never be able to strand a claim: a task left
+  // "running" is invisible to every later tick until CLAIM_STALE_MS, and a
+  // one-shot would never retire. Capture the failure, release, then report it.
+  let historyError: unknown;
+  try {
+    appendRun(taskId, {
+      runId: `${startedAt}`,
+      startedAt,
+      endedAt,
+      scheduledFor,
+      status: outcome.status,
+      exitCode: outcome.exitCode,
+      error: outcome.error,
+      output: outcome.output || undefined,
+    });
+  } catch (error) {
+    historyError = error;
+  }
 
   withRegistry((registry) => {
     const index = registry.tasks.findIndex((candidate) => candidate.id === taskId);
     if (index < 0) return;
     const current = registry.tasks[index];
     if (!current) return;
+    // Only the claim holder may settle. If this run went stale and another
+    // runner has since reclaimed the task, that runner owns the schedule now.
+    if (claimedAt !== undefined && current.runningSince !== claimedAt) return;
     const released = releaseTask(current, endedAt, outcome.status);
     if (released) registry.tasks[index] = released;
     else registry.tasks.splice(index, 1);
     writeRegistry(registry);
   });
+
+  if (historyError) throw historyError;
 }
 
 export function formatTask(task: DurableTask, now = Date.now()): string {

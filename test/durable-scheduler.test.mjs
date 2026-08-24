@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,6 +22,26 @@ function withTempDir(t) {
     rmSync(dir, { recursive: true, force: true });
   });
   return dir;
+}
+
+/**
+ * A pid belonging to a process that is really running.
+ *
+ * `process.pid` will not do: the claim checks exempt our own pid, so a test
+ * using it would pass whether or not liveness probing works at all.
+ */
+function livePid(t) {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  child.unref();
+  t.after(() => child.kill("SIGKILL"));
+  return child.pid;
+}
+
+/** A pid we watched exit, so the kernel agrees nothing owns it. */
+async function deadPid() {
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await new Promise((resolve) => child.on("exit", resolve));
+  return child.pid;
 }
 
 function mount() {
@@ -53,6 +74,42 @@ function mount() {
     last: () => notices.at(-1),
     run: (args = "") => commands.schedule.handler(args, ctx),
   };
+}
+
+/**
+ * A stand-in for `pi` that actually blocks.
+ *
+ * `/bin/sleep` was the obvious choice and it is wrong: the runner passes
+ * `-p --no-session --no-themes`, so sleep rejects the arguments and exits at
+ * once. Every "it did not block" assertion then passes whether or not the code
+ * under test awaited the run. This ignores argv, drains stdin the way pi does,
+ * and stays up until `release()` is called.
+ */
+function fakePi(t, dir) {
+  const gate = join(dir, "release");
+  const bin = join(dir, "fake-pi");
+  // Three ways out, so no child can outlive the test run: the gate appears,
+  // the temp dir is cleaned up, or 30s pass.
+  writeFileSync(bin, [
+    "#!/bin/sh",
+    "cat > /dev/null",
+    "i=0",
+    `while [ ! -e ${JSON.stringify(gate)} ] && [ -d ${JSON.stringify(dir)} ] && [ $i -lt 1500 ]; do`,
+    "  sleep 0.02",
+    "  i=$((i + 1))",
+    "done",
+    "echo done",
+  ].join("\n"), { mode: 0o700 });
+  chmodSync(bin, 0o700);
+
+  const previous = process.env.PI_SCHEDULER_PI_BIN;
+  process.env.PI_SCHEDULER_PI_BIN = bin;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_SCHEDULER_PI_BIN;
+    else process.env.PI_SCHEDULER_PI_BIN = previous;
+  });
+
+  return { release: () => writeFileSync(gate, "") };
 }
 
 test("tokenize keeps quoted runs together", () => {
@@ -606,4 +663,62 @@ test("a child that never reads stdin fails the run instead of crashing the tick"
   // would take the process down and every other due task with it.
   const outcome = await runTask(task, { timeoutMs: 30_000 });
   assert.equal(outcome.status, "error", "a child that exits nonzero is a failed run");
+});
+test("/schedule run takes over a claim whose runner died, like the CLI does", async (t) => {
+  const dir = withTempDir(t);
+  const ui = mount();
+  await ui.run("--name orphan daily 9a :: x");
+
+  // A runner that was SIGKILLed leaves its claim behind. Its pid is gone, so
+  // this is recoverable immediately — waiting out the age rule would mean six
+  // hours of a daily task silently not running.
+  const registry = readRegistry();
+  registry.tasks[0].runningSince = Date.now() - 1_000;
+  registry.tasks[0].runnerPid = await deadPid();
+  writeRegistry(registry);
+
+  fakePi(t, dir);
+  await ui.run("run orphan");
+
+  assert.match(ui.last().message, /its own pi, not this session/);
+  const claimed = readRegistry().tasks[0];
+  assert.equal(claimed.runnerPid, process.pid, "the stale claim was taken over");
+});
+
+test("/schedule run takes over a claim that outlived the window, pid alive or not", async (t) => {
+  const dir = withTempDir(t);
+  const ui = mount();
+  await ui.run("--name wedged daily 9a :: x");
+
+  // The other half of the rule: a runner still holding a pid but stuck far
+  // past timeout + 6h is wedged, not working, and must not own the task
+  // forever.
+  const registry = readRegistry();
+  registry.tasks[0].runningSince = Date.now() - (7 * 3_600_000);
+  registry.tasks[0].runnerPid = livePid(t);
+  writeRegistry(registry);
+
+  fakePi(t, dir);
+  await ui.run("run wedged");
+
+  assert.match(ui.last().message, /its own pi, not this session/);
+  assert.equal(readRegistry().tasks[0].runnerPid, process.pid);
+});
+
+test("/schedule run still refuses a claim whose runner is alive and in time", async (t) => {
+  const dir = withTempDir(t);
+  const ui = mount();
+  await ui.run("--name busy daily 9a :: x");
+
+  const pid = livePid(t);
+  const registry = readRegistry();
+  registry.tasks[0].runningSince = Date.now();
+  registry.tasks[0].runnerPid = pid;
+  writeRegistry(registry);
+
+  fakePi(t, dir);
+  await ui.run("run busy");
+
+  assert.equal(ui.last().level, "error");
+  assert.match(ui.last().message, new RegExp(`already running \\(pid ${pid}\\)`));
 });

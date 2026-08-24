@@ -370,14 +370,21 @@ export default function durableScheduler(pi: ExtensionAPI): void {
         if (run?.[1]) {
           const selector = run[1];
           // Claim first, so a scheduled tick a second later does not run the
-          // same task concurrently with this manual one.
+          // same task concurrently with this manual one. Same rule as
+          // `pi-scheduler run`: a claim counts as stale once its runner's pid
+          // is gone, or failing that once it has outlived timeout + 6h.
+          // Without it a task whose runner was killed is unrunnable from here
+          // while the CLI would run it happily.
           const claimed = withRegistry((registry) => {
             const existing = findTask(registry.tasks, selector);
-            if (existing.runningSince !== undefined) {
-              throw new Error(`${existing.name ?? existing.id} is already running`);
+            const now = Date.now();
+            if (existing.runningSince !== undefined && !isClaimStale(existing, now)) {
+              throw new Error(
+                `${existing.name ?? existing.id} is already running (pid ${existing.runnerPid})`,
+              );
             }
             const index = registry.tasks.indexOf(existing);
-            const task = { ...existing, runningSince: Date.now(), runnerPid: process.pid };
+            const task = claimTask(existing, now, process.pid);
             registry.tasks[index] = task;
             writeRegistry(registry);
             return task;
@@ -389,6 +396,9 @@ export default function durableScheduler(pi: ExtensionAPI): void {
           // Deliberately not awaited. A task's timeout defaults to 15m, and
           // blocking the conversation that long to watch an unattended job is
           // the wrong trade; the result arrives as a notice when it lands.
+          // Everything inside is guarded: this promise is discarded, so an
+          // escaping rejection would leave the footer stuck on "running", the
+          // claim held, and the user never told.
           void (async () => {
             let outcome;
             try {
@@ -400,15 +410,31 @@ export default function durableScheduler(pi: ExtensionAPI): void {
                 error: error instanceof Error ? error.message : String(error),
               };
             }
-            settleRun(claimed.id, claimed.nextRunAt, startedAt, outcome);
-            if (ctx.hasUI) ctx.ui.setStatus("schedule", "");
-            notice(
-              ctx,
-              `${claimed.name ?? claimed.id} ${outcome.status}`
-              + `${outcome.error ? `: ${outcome.error}` : ""}`
-              + `${outcome.output ? `\n${outcome.output}` : ""}`,
-              outcome.status === "ok" ? "info" : "error",
-            );
+            let settleError: string | undefined;
+            try {
+              settleRun(claimed.id, claimed.nextRunAt, startedAt, outcome, claimed.runningSince);
+            } catch (error) {
+              settleError = error instanceof Error ? error.message : String(error);
+            }
+            try {
+              if (ctx.hasUI) ctx.ui.setStatus("schedule", "");
+              notice(
+                ctx,
+                `${claimed.name ?? claimed.id} ${outcome.status}`
+                + `${outcome.error ? `: ${outcome.error}` : ""}`
+                + `${settleError ? `\ncould not record the run: ${settleError}` : ""}`
+                + `${outcome.output ? `\n${outcome.output}` : ""}`,
+                outcome.status === "ok" && !settleError ? "info" : "error",
+              );
+            } catch (error) {
+              // The session went away mid-run, so there is nothing left to
+              // report to. Say it somewhere, or a run stuck on "running" in the
+              // footer looks like a hang with no explanation anywhere.
+              process.emitWarning(
+                `Could not report the result of ${claimed.name ?? claimed.id}:`
+                + ` ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
           })();
 
           if (ctx.hasUI) ctx.ui.setStatus("schedule", `running ${claimed.name ?? claimed.id}`);
