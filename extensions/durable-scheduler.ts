@@ -18,9 +18,12 @@ import {
   FEATURES,
   MAX_DURABLE_TASKS,
   type MisfirePolicy,
+  claimTask,
   findTask,
   formatTask,
+  isClaimStale,
   makeTaskId,
+  nameTaken,
   parseFeatures,
   readRegistry,
   readRuns,
@@ -504,7 +507,7 @@ export default function durableScheduler(pi: ExtensionAPI): void {
             notice(ctx, "A task cannot be named all; that word selects every task", "error");
             return;
           }
-          if (typeof name === "string" && registry.tasks.some((task) => task.name === name)) {
+          if (typeof name === "string" && nameTaken(registry.tasks, name)) {
             notice(ctx, `A task named ${name} already exists`, "error");
             return;
           }

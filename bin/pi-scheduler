@@ -65,7 +65,10 @@ import {
   findTask,
   forgetRuns,
   formatTask,
+  isClaimStale,
+  isDurableTask,
   makeTaskId,
+  nameTaken,
   parseFeatures,
   pruneRuns,
   readRegistry,
@@ -349,7 +352,7 @@ function commandAdd(rest, flags) {
     if (flags.name && /^all$/i.test(flags.name)) {
       die("a task cannot be named all; that word selects every task");
     }
-    if (flags.name && registry.tasks.some((task) => task.name === flags.name)) {
+    if (flags.name && nameTaken(registry.tasks, flags.name)) {
       die(`a task named ${flags.name} already exists`);
     }
     const task = applyFlags({
@@ -378,6 +381,12 @@ function commandEdit(selector, flags) {
     const index = registry.tasks.indexOf(existing);
     const task = applyFlags({ ...existing }, flags);
 
+    if (flags.name !== undefined) {
+      if (/^all$/i.test(flags.name)) die("a task cannot be named all; that word selects every task");
+      if (nameTaken(registry.tasks, flags.name, existing.id)) {
+        die(`a task named ${flags.name} already exists`);
+      }
+    }
     if (flags.prompt !== undefined) task.prompt = flags.prompt;
     if (flags.schedule !== undefined) {
       const parsed = parseScheduleSpec(`${flags.schedule} placeholder`);
@@ -389,6 +398,11 @@ function commandEdit(selector, flags) {
       const next = firstRunAfter(task) ?? parsed.nextRunAt;
       task.nextRunAt = next;
     }
+
+    // The same gate the loader applies. Writing a task that fails it — an
+    // empty --prompt is the easy way — would make it disappear on the next
+    // read, which reads to the user as "edit deleted my task".
+    if (!isDurableTask(task)) die("that edit would leave the task invalid; nothing was changed");
 
     registry.tasks[index] = task;
     writeRegistry(registry);

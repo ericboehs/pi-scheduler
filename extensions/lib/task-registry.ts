@@ -349,6 +349,16 @@ export function findTasks(tasks: DurableTask[], selector: string): DurableTask[]
   return tasks.filter((task) => task.id.startsWith(needle));
 }
 
+/**
+ * Whether `name` collides with an existing task, compared case-insensitively
+ * because `findTask` resolves names that way: `Grades` alongside `grades`
+ * would make both permanently ambiguous.
+ */
+export function nameTaken(tasks: DurableTask[], name: string, exceptId?: string): boolean {
+  const needle = name.toLowerCase();
+  return tasks.some((task) => task.id !== exceptId && task.name?.toLowerCase() === needle);
+}
+
 export function findTask(tasks: DurableTask[], selector: string): DurableTask {
   const matches = findTasks(tasks, selector);
   const task = matches[0];
