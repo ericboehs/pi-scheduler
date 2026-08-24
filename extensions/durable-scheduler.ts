@@ -351,8 +351,19 @@ export default function durableScheduler(pi: ExtensionAPI): void {
         // and returned history instead of running the task.
         const runs = input.match(/^(?:runs|history)\s+(\S+)$/i);
         if (runs?.[1]) {
-          const task = findTask(readRegistry().tasks, runs[1]);
-          const records = readRuns(task.id, 10);
+          // A one-shot leaves the registry as soon as it finishes, so fall back
+          // to the raw id: the run log is the only surviving trace of a
+          // reminder that failed, and that is exactly when you go looking.
+          const selector = runs[1];
+          const tasks = readRegistry().tasks;
+          let taskId;
+          try {
+            taskId = findTask(tasks, selector).id;
+          } catch (error) {
+            if (readRuns(selector, 1).length === 0) throw error;
+            taskId = selector;
+          }
+          const records = readRuns(taskId, 10);
           notice(
             ctx,
             records.length > 0

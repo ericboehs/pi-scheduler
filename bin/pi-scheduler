@@ -357,20 +357,25 @@ function commandShow(selector) {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
+/**
+ * Resolve what to read history for.
+ *
+ * One-shots leave the registry as soon as they finish, so a selector that
+ * matches no live task may still be the id of a retired one — and its run log
+ * is then the only surviving trace of a reminder that failed.
+ */
+function runsTaskId(tasks, selector) {
+  if (tasks.some((task) => task.id === selector)) return selector;
+  try {
+    return findTask(tasks, selector).id;
+  } catch (error) {
+    if (readRuns(selector, 1).length > 0) return selector;
+    throw error;
+  }
+}
+
 function commandRuns(selector, limit) {
-  // One-shots leave the registry as soon as they finish, so fall back to the
-  // raw id: the run log is the only surviving trace of a reminder that failed.
-  const tasks = readRegistry().tasks;
-  const taskId = tasks.some((task) => task.id === selector)
-    ? selector
-    : (() => {
-        try {
-          return findTask(tasks, selector).id;
-        } catch (error) {
-          if (readRuns(selector, 1).length > 0) return selector;
-          throw error;
-        }
-      })();
+  const taskId = runsTaskId(readRegistry().tasks, selector);
 
   const records = readRuns(taskId, Number.isFinite(limit) ? limit : 10);
   if (records.length === 0) {
