@@ -34,6 +34,20 @@ export interface RunOutcome {
 }
 
 const MAX_CAPTURED_OUTPUT = 200_000;
+/**
+ * Cap for the copy of the output passed in the environment.
+ *
+ * Linux caps a single argument or environment string at MAX_ARG_STRLEN, 32
+ * pages — 128KiB — and `execve` fails the whole spawn with E2BIG if any one
+ * exceeds it. A task that produced more than that got "deliver failed to
+ * start: spawn E2BIG" and no delivery at all, on Linux only, at whatever size
+ * its output happened to cross the line. macOS has no equivalent per-string
+ * limit, so this never showed up there.
+ *
+ * stdin carries the whole output and has no such limit, so the variable is a
+ * convenience for one-liners and is the copy that gets shortened.
+ */
+const MAX_ENV_OUTPUT = 100_000;
 const DELIVERY_TIMEOUT_MS = 120_000;
 
 export function piArgsFor(task: DurableTask): string[] {
@@ -169,6 +183,13 @@ function capture(
   });
 }
 
+/** The output as the environment can carry it, marked if it had to be cut. */
+function envOutput(output: string): string {
+  if (output.length <= MAX_ENV_OUTPUT) return output;
+  return `${output.slice(0, MAX_ENV_OUTPUT)}\n\n… truncated at ${MAX_ENV_OUTPUT} characters;`
+    + ` the full output is on stdin`;
+}
+
 /**
  * The directory the run should happen in.
  *
@@ -259,7 +280,7 @@ export async function runTask(
   try {
     delivery = await capture("/bin/sh", ["-c", task.deliver], {
       cwd,
-      env: { ...env, PI_SCHEDULER_OUTPUT: output, PI_SCHEDULER_TASK: task.name ?? task.id },
+      env: { ...env, PI_SCHEDULER_OUTPUT: envOutput(output), PI_SCHEDULER_TASK: task.name ?? task.id },
       input: output,
       timeoutMs: deliveryTimeoutMs,
     });

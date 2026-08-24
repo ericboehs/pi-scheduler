@@ -3,6 +3,17 @@ import test from "node:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
+
+// A pid that is genuinely free: spawn something and wait for it to exit. A
+// hardcoded low number is not a substitute — pid 2 is unused on macOS but is
+// kthreadd on Linux, which turned "this runner is dead" into "this runner is
+// alive" and only failed on one of the two platforms in CI.
+async function deadPid() {
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await new Promise((resolve) => child.on("exit", resolve));
+  return child.pid;
+}
 
 // The registry resolves its directory from the environment at call time, so
 // every test gets a private scheduler root and none of them touch ~/.pi.
@@ -459,13 +470,15 @@ test("a claim records the machine that made it", () => {
   assert.equal(released.runningSince, undefined);
 });
 
-test("a claim from another machine is never declared dead by pid", () => {
+test("a claim from another machine is never declared dead by pid", async () => {
   // The failure this prevents: two machines on one synced registry. B probes
   // A's pid, gets ESRCH for a runner that is fine, and runs the prompt again.
+  // The pid is a dead one on purpose: if the host guard were dropped, the probe
+  // would report it stale and this test would fail rather than pass by luck.
   const foreign = {
     ...task(),
     runningSince: Date.now() - 1_000,
-    runnerPid: 2,
+    runnerPid: await deadPid(),
     runnerHost: `not-${hostname()}`,
   };
   assert.equal(isClaimStale(foreign, Date.now()), false, "a foreign pid says nothing");
@@ -475,11 +488,11 @@ test("a claim from another machine is never declared dead by pid", () => {
   assert.equal(isClaimStale({ ...foreign, runningSince: Date.now() - (7 * 3_600_000) }, Date.now()), true);
 });
 
-test("a claim with no host is still probed, so upgrades keep working", () => {
+test("a claim with no host is still probed, so upgrades keep working", async () => {
   // Written by a version before runnerHost existed. Treating undefined as
   // "foreign" would silently disable pid staleness for every existing claim.
-  const legacy = { ...task(), runningSince: Date.now() - 1_000, runnerPid: 2 };
-  assert.equal(isClaimStale(legacy, Date.now()), true, "pid 2 is not a live runner here");
+  const legacy = { ...task(), runningSince: Date.now() - 1_000, runnerPid: await deadPid() };
+  assert.equal(isClaimStale(legacy, Date.now()), true, "a dead runner leaves a stale claim");
 });
 
 test("a claim carrying an unknown host is valid, not quarantined", () => {

@@ -160,6 +160,31 @@ test("deliver gets the output on stdin and in $PI_SCHEDULER_OUTPUT", async (t) =
   assert.equal(readFileSync(envFile, "utf8"), "the report|reporter");
 });
 
+test("a large output still reaches deliver, on Linux as well as macOS", async (t) => {
+  const dir = withTempDir(t);
+  // Over Linux's 128KiB MAX_ARG_STRLEN once it is in the environment. Passing
+  // it whole made execve fail with E2BIG, so a task lost its delivery entirely
+  // at whatever output size it happened to cross that line — and only there.
+  const piBin = script(dir, "pi", 'cat > /dev/null; yes "the report" | head -c 150000');
+  const stdinFile = join(dir, "delivered-stdin");
+  const envFile = join(dir, "delivered-env");
+
+  const outcome = await runTask(
+    task(dir, {
+      deliver: `cat > ${JSON.stringify(stdinFile)}; printf '%s' "$PI_SCHEDULER_OUTPUT" > ${JSON.stringify(envFile)}`,
+    }),
+    { piBin },
+  );
+
+  assert.equal(outcome.status, "ok", outcome.error);
+  // stdin has no such limit, so it carries the whole thing.
+  assert.equal(readFileSync(stdinFile, "utf8").length, outcome.output.length);
+  // The environment copy is shortened, and says so rather than looking complete.
+  const fromEnv = readFileSync(envFile, "utf8");
+  assert.ok(fromEnv.length < outcome.output.length);
+  assert.match(fromEnv, /the full output is on stdin$/);
+});
+
 test("a deliver command that ignores stdin is fine; plenty of one-liners do", async (t) => {
   const dir = withTempDir(t);
   // Far more than a pipe buffer, so `true` exiting without reading really does
