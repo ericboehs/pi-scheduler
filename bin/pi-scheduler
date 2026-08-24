@@ -139,28 +139,98 @@ function usage() {
   process.stdout.write(`${text}\n`);
 }
 
-/** Split flags out of an argv tail, leaving the positional words untouched. */
-function parseFlags(argv) {
+/**
+ * Every long flag this CLI understands, and which commands understand it.
+ *
+ * An allowlist rather than a catch-all: `--modle gpt-5` silently creating a
+ * task on the default model is the kind of thing you only notice a week later,
+ * in the run log, when the bill arrives. Scoping it per command catches the
+ * quieter version of the same mistake — `list --model x`, `add -n 5` — where
+ * the flag is real but does nothing where you put it.
+ */
+const TASK_FLAGS = [
+  "name", "model", "cwd", "with", "without", "deliver", "misfire", "timeout",
+  "tools", "no-tools", "no-deliver",
+];
+const COMMAND_FLAGS = {
+  check: [],
+  list: ["all"],
+  ls: ["all"],
+  show: [],
+  add: TASK_FLAGS,
+  create: TASK_FLAGS,
+  edit: [...TASK_FLAGS, "prompt", "schedule"],
+  update: [...TASK_FLAGS, "prompt", "schedule"],
+  run: [],
+  runs: ["limit"],
+  history: ["limit"],
+  pause: [],
+  resume: [],
+  remove: [],
+  rm: [],
+  delete: [],
+  prune: [],
+  install: [],
+  uninstall: [],
+};
+
+/** Flags that take a value, as written on the command line. */
+const VALUE_FLAGS = new Set([
+  "name", "model", "cwd", "with", "without", "deliver", "misfire", "timeout", "prompt", "schedule",
+]);
+const BOOL_FLAGS = new Set(["tools", "no-tools", "no-deliver", "all"]);
+
+/**
+ * Split flags out of an argv tail, leaving the positional words untouched.
+ *
+ * `allowed` is the flag list for the command being run; anything outside it is
+ * refused with a message naming what this command does take.
+ */
+function parseFlags(argv, allowed) {
   const flags = {};
   const rest = [];
+  const permit = (name, spelling) => {
+    if (allowed.includes(name)) return;
+    const known = allowed.length
+      ? allowed.map((flag) => (flag === "limit" ? "-n" : `--${flag}`)).join(" ")
+      : "no flags";
+    die(`${spelling} is not a flag this command takes; it takes ${known}`);
+  };
+
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--") {
       rest.push(...argv.slice(index + 1));
       break;
     }
-    if (arg === "--tools") { flags.tools = true; continue; }
-    if (arg === "--no-tools") { flags.tools = false; continue; }
-    if (arg === "--no-deliver") { flags.deliver = null; continue; }
-    if (arg === "--all") { flags.all = true; continue; }
-    if (arg === "-n") { flags.limit = Number(argv[++index]); continue; }
+    if (arg === "--tools") { permit("tools", arg); flags.tools = true; continue; }
+    if (arg === "--no-tools") { permit("no-tools", arg); flags.tools = false; continue; }
+    if (arg === "--no-deliver") { permit("no-deliver", arg); flags.deliver = null; continue; }
+    if (arg === "--all") { permit("all", arg); flags.all = true; continue; }
+    if (arg === "-n") {
+      permit("limit", arg);
+      const raw = argv[++index];
+      const limit = Number(raw);
+      if (raw === undefined || !Number.isInteger(limit) || limit <= 0) {
+        die("-n wants a positive whole number of runs");
+      }
+      flags.limit = limit;
+      continue;
+    }
     if (arg?.startsWith("--")) {
       const [name, inline] = arg.slice(2).split(/=(.*)/s);
+      if (!VALUE_FLAGS.has(name)) {
+        die(BOOL_FLAGS.has(name) ? `--${name} takes no value` : `unknown flag --${name}`);
+      }
+      permit(name, `--${name}`);
       const value = inline ?? argv[++index];
       if (value === undefined) die(`--${name} needs a value`);
       flags[name] = value;
       continue;
     }
+    // Anything else beginning with a dash is a typo, not a task name. `--` is
+    // already the escape hatch for a selector that genuinely starts with one.
+    if (arg?.startsWith("-") && arg !== "-") die(`unknown flag ${arg}`);
     rest.push(arg);
   }
   return { flags, rest };
@@ -675,7 +745,12 @@ function commandUninstall() {
 
 async function main() {
   const [command, ...argv] = process.argv.slice(2);
-  const { flags, rest } = parseFlags(argv);
+  if (command === undefined || command === "help" || command === "-h" || command === "--help") {
+    return usage();
+  }
+  const allowed = COMMAND_FLAGS[command];
+  if (allowed === undefined) return die(`unknown command ${command}`);
+  const { flags, rest } = parseFlags(argv, allowed);
 
   switch (command) {
     case "check": return commandCheck();
@@ -691,7 +766,6 @@ async function main() {
     case "prune": return commandPrune();
     case "install": return commandInstall();
     case "uninstall": return commandUninstall();
-    case undefined: case "help": case "-h": case "--help": return usage();
     default: return die(`unknown command ${command}`);
   }
 }
