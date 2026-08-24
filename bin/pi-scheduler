@@ -8,7 +8,7 @@
  * the idle cost is one short-lived node process per minute.
  *
  * The registry, the schedule maths and the runner are shared with the
- * /schedule slash command in .pi-agent/extensions, so both agree on when a
+ * /schedule slash command in extensions/, so both agree on when a
  * task is due and what "run it" means.
  *
  * Usage: pi-scheduler <command> [options]

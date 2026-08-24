@@ -1,0 +1,18 @@
+{
+  "name": "pi-scheduler",
+  "version": "0.1.0",
+  "description": "Scheduled prompts for pi: session timers with /once and /loop, and durable tasks with /schedule that run without an open session.",
+  "keywords": ["pi-package", "scheduler", "cron", "launchd", "systemd"],
+  "license": "MIT",
+  "author": "Eric Boehs",
+  "repository": { "type": "git", "url": "git+https://github.com/ericboehs/pi-scheduler.git" },
+  "type": "module",
+  "bin": { "pi-scheduler": "./bin/pi-scheduler" },
+  "engines": { "node": ">=22.18.0" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "pi": {
+    "//": "Explicit glob, not the extensions/ convention: lib/ holds shared modules that are imported, not loaded as extensions.",
+    "extensions": ["extensions/*.ts"]
+  }
+}
