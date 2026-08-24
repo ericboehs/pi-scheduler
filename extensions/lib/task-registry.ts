@@ -365,9 +365,10 @@ function lockAgeMs(): number | undefined {
  * Read-modify-write the registry under a mkdir mutex.
  *
  * mkdir is the one filesystem primitive that is atomic on every macOS
- * filesystem including network volumes, and the lock is only ever held for the
- * few milliseconds of a JSON round trip — the actual agent run happens outside
- * it, guarded instead by the claim fields on the task.
+ * filesystem including network volumes. It is held for the JSON round trip
+ * plus whatever the caller does inside `mutate` — `check` also compacts run
+ * logs there, which is the longest critical section. The actual agent run
+ * happens outside it, guarded instead by the claim fields on the task.
  */
 export function withRegistry<T>(mutate: (registry: Registry) => T): T {
   ensureDir(schedulerDir());
@@ -389,10 +390,16 @@ export function withRegistry<T>(mutate: (registry: Registry) => T): T {
       continue;
     }
 
+    // A `process.exit` from inside `mutate` would skip the finally below and
+    // strand this lock for the full stale window, blocking every other
+    // invocation. Belt and braces: release it on the way out too.
+    const release = () => rmSync(path, { recursive: true, force: true });
+    process.once("exit", release);
     try {
       return mutate(readRegistry());
     } finally {
-      rmSync(path, { recursive: true, force: true });
+      process.removeListener("exit", release);
+      release();
     }
   }
 

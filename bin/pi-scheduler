@@ -102,9 +102,18 @@ const NODE = process.execPath;
 /** Unflagged TypeScript type stripping, which this script relies on to import lib/*.ts. */
 const MIN_NODE = [22, 18, 0];
 
+/**
+ * Fail with a message.
+ *
+ * This throws rather than exiting, because most of the calls sit inside
+ * `withRegistry`, and `process.exit` there would skip the `finally` that
+ * removes the lock directory. There is an `exit` listener as a backstop now,
+ * but throwing is still the right shape: it unwinds through the same path as
+ * any other failure, so there is one way out instead of two. `main`'s catch
+ * does the actual exiting.
+ */
 function die(message) {
-  process.stderr.write(`pi-scheduler: ${message}\n`);
-  process.exit(1);
+  throw new Error(message);
 }
 
 function usage() {
@@ -669,5 +678,6 @@ async function main() {
 try {
   await main();
 } catch (error) {
-  die(error instanceof Error ? error.message : String(error));
+  process.stderr.write(`pi-scheduler: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exit(1);
 }
