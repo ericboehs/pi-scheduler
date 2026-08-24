@@ -445,3 +445,136 @@ test("stays quiet once the session has an assistant message", async (t) => {
   await ui.run("loop", "1h morning report");
   assert.equal(ui.notices.filter((n) => /no model reply yet/.test(n.message)).length, 0);
 });
+
+test("switching sessions disarms the old timers, so a prompt cannot land in the wrong chat", async (t) => {
+  const handlers = {};
+  const sentTo = { a: [], b: [] };
+
+  const makeCtx = (sessionId, entries) => ({
+    hasUI: true,
+    isIdle: () => true,
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getBranch: () => entries,
+    },
+    ui: { notify: () => {}, confirm: async () => true, setStatus: () => {} },
+  });
+
+  const entriesA = [{ type: "message", message: { role: "assistant", content: [] } }];
+  const entriesB = [{ type: "message", message: { role: "assistant", content: [] } }];
+  let current = "a";
+
+  sessionScheduler({
+    on: (name, handler) => { handlers[name] = handler; },
+    registerCommand: () => {},
+    registerTool: () => {},
+    appendEntry: (customType, data) => {
+      (current === "a" ? entriesA : entriesB).push({ type: "custom", customType, data });
+    },
+    sendUserMessage: (prompt) => { sentTo[current].push(prompt); },
+  });
+
+  const ctxA = makeCtx("session-a", entriesA);
+  const ctxB = makeCtx("session-b", entriesB);
+
+  await handlers.session_start({ reason: "startup" }, ctxA);
+  // Armed in A, and deliberately not yet due.
+  entriesA.push(snapshot("session-a", [{
+    id: "aaaaaaaa",
+    kind: "once",
+    prompt: "a secret from session A",
+    createdAt: Date.now(),
+    nextRunAt: Date.now() + 30,
+  }]));
+  await handlers.session_start({ reason: "resume" }, ctxA);
+
+  // Now the user switches. A's timer is still counting down at this point.
+  current = "b";
+  await handlers.session_start({ reason: "switch" }, ctxB);
+
+  await new Promise((resolve) => setTimeout(resolve, 120));
+
+  assert.deepEqual(sentTo.b, [], "A's prompt must never be delivered into B");
+  assert.deepEqual(sentTo.a, [], "and A is no longer the active session either");
+
+  await handlers.session_shutdown({ reason: "quit" }, ctxB);
+});
+
+test("an unreadable latest snapshot does not resurrect timers from an older one", async (t) => {
+  const cancelled = {
+    id: "deadbeef",
+    kind: "interval",
+    intervalMs: 60_000,
+    prompt: "the one you cancelled",
+    createdAt: Date.now(),
+    nextRunAt: Date.now() + 60_000,
+  };
+  const ui = await mount({
+    branch: [
+      snapshot("session-a", [cancelled]),
+      // A later snapshot that cannot be trusted. Falling back to the one above
+      // would re-arm a timer the user has since cancelled.
+      { type: "custom", customType: "session-scheduler:snapshot", data: { version: 99, sessionId: "session-a", tasks: [] } },
+    ],
+  });
+  t.after(ui.shutdown);
+
+  await ui.run("loop", "list");
+  assert.match(ui.notices.at(-1).message, /No timers in this session/);
+});
+
+test("a one-shot that fails to deliver is kept, not silently dropped", async (t) => {
+  const handlers = {};
+  const entries = [{ type: "message", message: { role: "assistant", content: [] } }];
+  const notices = [];
+  let failNext = true;
+
+  sessionScheduler({
+    on: (name, handler) => { handlers[name] = handler; },
+    registerCommand: () => {},
+    registerTool: () => {},
+    appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
+    sendUserMessage: () => {
+      if (failNext) throw new Error("the agent is wedged");
+    },
+  });
+
+  const ctx = {
+    hasUI: true,
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "session-a", getBranch: () => entries },
+    ui: {
+      notify: (message, level) => notices.push({ message, level }),
+      confirm: async () => true,
+      setStatus: () => {},
+    },
+  };
+
+  entries.push(snapshot("session-a", [{
+    id: "deadbeef",
+    kind: "once",
+    prompt: "the reminder that matters",
+    createdAt: Date.now(),
+    nextRunAt: Date.now() + 20,
+  }]));
+  await handlers.session_start({ reason: "resume" }, ctx);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.match(notices.at(-1).message, /Could not deliver/);
+
+  // Removing it before the send succeeded would leave the reminder in neither
+  // the queue nor the snapshot, and it would simply never arrive.
+  const stillQueued = entries.filter((entry) => entry.type === "custom").at(-1)?.data.tasks ?? [];
+  assert.deepEqual(
+    stillQueued.map((task) => task.id),
+    ["deadbeef"],
+    "the undelivered one-shot is still in the snapshot",
+  );
+
+  failNext = false;
+  await handlers.agent_settled({}, ctx);
+  const afterDelivery = entries.filter((entry) => entry.type === "custom").at(-1)?.data.tasks ?? [];
+  assert.deepEqual(afterDelivery, [], "and it retires only once it has actually landed");
+
+  await handlers.session_shutdown({ reason: "quit" }, ctx);
+});

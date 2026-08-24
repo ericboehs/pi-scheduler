@@ -108,9 +108,25 @@ function isScheduledTask(value: unknown): value is ScheduledTask {
   return true;
 }
 
+/**
+ * The newest snapshot for this session, or nothing.
+ *
+ * Deliberately not "the newest *valid* snapshot": falling back to an older one
+ * would resurrect timers the user has since cancelled. A snapshot that is
+ * present but unusable means no timers, which is the same thing a fresh
+ * session gets and is the only safe reading of it. Only a well-formed snapshot
+ * that names a *different* session is skipped over — that one genuinely is not
+ * ours, and a fork should keep looking past it.
+ */
 function readSnapshot(ctx: ExtensionContext): ScheduledTask[] {
   const sessionId = ctx.sessionManager.getSessionId();
   const branch = ctx.sessionManager.getBranch();
+  // A warning nobody reads is not a warning. In a TUI the only place the user
+  // will actually see "your timers did not come back" is a notice.
+  const warn = (message: string) => {
+    if (ctx.hasUI) ctx.ui.notify(message, "warning");
+    else process.emitWarning(message);
+  };
 
   for (let index = branch.length - 1; index >= 0; index -= 1) {
     const entry = branch[index] as {
@@ -119,17 +135,30 @@ function readSnapshot(ctx: ExtensionContext): ScheduledTask[] {
       data?: unknown;
     };
     if (entry.type !== "custom" || entry.customType !== SNAPSHOT_TYPE) continue;
-    if (!entry.data || typeof entry.data !== "object") continue;
 
-    const snapshot = entry.data as Partial<SchedulerSnapshot>;
-    if (
-      snapshot.version !== SNAPSHOT_VERSION ||
-      snapshot.sessionId !== sessionId ||
-      !Array.isArray(snapshot.tasks)
-    ) {
-      continue;
+    // Note `typeof null === "object"`, which is why null is excluded by hand.
+    if (entry.data === null || typeof entry.data !== "object" || Array.isArray(entry.data)) {
+      warn(`Ignoring a corrupt scheduler snapshot; no timers were restored in ${sessionId}`);
+      return [];
     }
-    return snapshot.tasks.filter(isScheduledTask).map((task) => ({ ...task }));
+    const snapshot = entry.data as Partial<SchedulerSnapshot>;
+    if (typeof snapshot.sessionId !== "string") {
+      warn(`Ignoring a scheduler snapshot with no session id; no timers were restored`);
+      return [];
+    }
+    // A snapshot that plainly belongs to another session is not ours to
+    // restore, and not evidence of corruption either; keep looking.
+    if (snapshot.sessionId !== sessionId) continue;
+
+    if (snapshot.version !== SNAPSHOT_VERSION || !Array.isArray(snapshot.tasks)) {
+      warn(`Ignoring an unreadable scheduler snapshot; no timers were restored in ${sessionId}`);
+      return [];
+    }
+    const valid = snapshot.tasks.filter(isScheduledTask);
+    if (valid.length !== snapshot.tasks.length) {
+      warn(`Dropped ${snapshot.tasks.length - valid.length} malformed session timer(s) while restoring`);
+    }
+    return valid.map((task) => ({ ...task }));
   }
 
   return [];
@@ -164,8 +193,9 @@ function makeTaskId(existing: ScheduledTask[]): string {
  * Session-scoped timers: `/once` and `/loop`.
  *
  * These live and die with the pi process and the conversation that created
- * them — they fire into the current session, using its model and context, and
- * missed fires are dropped rather than replayed. Anything that must run
+ * them — they fire into the current session, using its model and context. A
+ * fire while the agent is busy is queued and delivered when it goes idle; a
+ * fire while pi is not running is lost, never replayed. Anything that must run
  * whether or not pi is open belongs to `/schedule` (durable-scheduler.ts).
  */
 export default function sessionScheduler(pi: ExtensionAPI): void {
@@ -220,19 +250,31 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
 
     const [id, task] = next;
     pending.delete(id);
-    if (task.kind === "once") {
-      tasks = tasks.filter((candidate) => candidate.id !== task.id);
-      persist();
-    }
     deliveryInFlight = true;
     updateStatus(ctx);
     if (ctx.hasUI) ctx.ui.notify(`Scheduled task ${task.id} fired`, "info");
     try {
       pi.sendUserMessage(task.prompt);
     } catch (error) {
+      // Put it back before persisting anything: a one-shot removed from the
+      // snapshot and then failing to deliver would be gone from both the
+      // session and the queue, and the user would simply never be reminded.
       deliveryInFlight = false;
       pending.set(id, task);
       notice(ctx, `Could not deliver scheduled task ${id}: ${error instanceof Error ? error.message : String(error)}`, "error");
+      return;
+    }
+
+    // Delivered. Only now is a one-shot really finished.
+    if (task.kind === "once") {
+      tasks = tasks.filter((candidate) => candidate.id !== task.id);
+      try {
+        persist();
+      } catch (error) {
+        // The snapshot is stale, not the timers. Say so rather than throwing
+        // out of a timer callback, which nothing above here would catch.
+        notice(ctx, `Delivered ${id}, but could not record it: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
     }
   };
 
@@ -453,7 +495,12 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     );
   };
 
-  /** `list`, `cancel`, `pause`, `resume`, `clear` — shared by /once and /loop. */
+  /**
+   * The management verbs, shared by /once and /loop.
+   *
+   * /loop gets all five; /once exposes only `list` and `cancel`, since the
+   * others describe a timer that will fire again and a one-shot will not.
+   */
   const handleManagement = async (
     input: string,
     ctx: ExtensionContext,
