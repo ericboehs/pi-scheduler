@@ -57,7 +57,8 @@ export const CLAIM_STALE_MS = 6 * 3_600_000;
 
 const LOCK_STALE_MS = 60_000;
 
-export type RunStatus = "ok" | "error" | "timeout" | "skipped";
+export const RUN_STATUSES = ["ok", "error", "timeout", "skipped"] as const;
+export type RunStatus = (typeof RUN_STATUSES)[number];
 
 /**
  * `skip` never runs late, `always` always does, and a number is the grace
@@ -167,6 +168,15 @@ export interface DurableTask extends Schedule {
 export interface Registry {
   version: number;
   tasks: DurableTask[];
+  /**
+   * Entries that failed validation, carried through untouched.
+   *
+   * They are never scheduled, never matched by name, and never counted — but
+   * `writeRegistry` puts them back, so a task this version cannot parse (a
+   * hand-edit, a half-written line, a field from a newer release) survives
+   * instead of being deleted by whatever `add` happens to run next.
+   */
+  quarantined?: unknown[];
 }
 
 export interface RunRecord {
@@ -228,7 +238,7 @@ export function emptyRegistry(): Registry {
   return { version: REGISTRY_VERSION, tasks: [] };
 }
 
-const KINDS: ScheduleKind[] = ["interval", "daily", "once", "cron"];
+export const SCHEDULE_KINDS = ["interval", "daily", "once", "cron"] as const;
 
 export function isDurableTask(value: unknown): value is DurableTask {
   if (!value || typeof value !== "object") return false;
@@ -236,14 +246,29 @@ export function isDurableTask(value: unknown): value is DurableTask {
   if (
     typeof task.id !== "string" ||
     !task.id ||
-    !KINDS.includes(task.kind as ScheduleKind) ||
+    !SCHEDULE_KINDS.includes(task.kind as ScheduleKind) ||
     typeof task.prompt !== "string" ||
     !task.prompt.trim() ||
-    typeof task.createdAt !== "number" ||
-    typeof task.nextRunAt !== "number"
+    !Number.isFinite(task.createdAt) ||
+    !Number.isFinite(task.nextRunAt)
   ) {
     return false;
   }
+  // A non-positive timeout would make every run time out before it started.
+  if (task.timeoutMs !== undefined && (!Number.isFinite(task.timeoutMs) || task.timeoutMs <= 0)) return false;
+  // A numeric misfire policy is a grace window; NaN/Infinity/negatives are not.
+  if (task.misfire !== undefined && task.misfire !== "skip" && task.misfire !== "always"
+    && (typeof task.misfire !== "number" || !Number.isFinite(task.misfire) || task.misfire < 0)) {
+    return false;
+  }
+  // A claim is both fields or neither; half of one is a torn write.
+  if ((task.runningSince === undefined) !== (task.runnerPid === undefined)) return false;
+  if (task.runningSince !== undefined && !Number.isFinite(task.runningSince)) return false;
+  // Optional, and deliberately not required even alongside a claim: a registry
+  // written by an older version has claims without it. Quarantining those
+  // would make an upgrade look like the tasks had vanished.
+  if (task.runnerHost !== undefined && typeof task.runnerHost !== "string") return false;
+
   if (task.kind === "interval") {
     return typeof task.intervalMs === "number" && task.intervalMs >= MIN_INTERVAL_MS;
   }
@@ -257,37 +282,70 @@ export function isDurableTask(value: unknown): value is DurableTask {
 }
 
 /**
- * A corrupt or unreadable registry reads as empty rather than throwing: the
- * runner is started by launchd every minute with nobody watching stderr, and a
- * hard failure there is indistinguishable from "no tasks" except that it never
- * recovers. Individual malformed tasks are dropped, not the whole file.
+ * Raised when tasks.json exists but cannot be trusted.
+ *
+ * This is deliberately not swallowed. "Unreadable" used to read as "empty",
+ * which is survivable for a tick that finds nothing to do but catastrophic for
+ * the next `add` or `edit`: it would write an empty-plus-one registry over a
+ * file full of perfectly good tasks. A missing file is the only condition that
+ * legitimately means "no tasks".
+ */
+export class RegistryUnreadableError extends Error {
+  constructor(reason: string) {
+    super(`Cannot read ${registryPath()}: ${reason}. Nothing was changed; fix or move the file aside.`);
+    this.name = "RegistryUnreadableError";
+  }
+}
+
+/**
+ * Read the registry. A missing file is an empty registry; anything else that
+ * goes wrong throws. Individual malformed tasks are still dropped rather than
+ * failing the whole file, since one bad entry should not strand the others.
  */
 export function readRegistry(): Registry {
   let raw: string;
   try {
     raw = readFileSync(registryPath(), "utf8");
-  } catch {
-    return emptyRegistry();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return emptyRegistry();
+    throw new RegistryUnreadableError(code ?? String(error));
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
-    return emptyRegistry();
+  } catch (error) {
+    throw new RegistryUnreadableError(error instanceof Error ? error.message : "invalid JSON");
   }
 
   const candidate = parsed as Partial<Registry>;
-  if (candidate?.version !== REGISTRY_VERSION || !Array.isArray(candidate.tasks)) {
-    return emptyRegistry();
+  if (candidate?.version !== REGISTRY_VERSION) {
+    throw new RegistryUnreadableError(`version ${String(candidate?.version)} is not ${REGISTRY_VERSION}`);
   }
-  return { version: REGISTRY_VERSION, tasks: candidate.tasks.filter(isDurableTask) };
+  if (!Array.isArray(candidate.tasks)) {
+    throw new RegistryUnreadableError("tasks is not an array");
+  }
+  const tasks = candidate.tasks.filter(isDurableTask);
+  const quarantined = candidate.tasks.filter((task) => !isDurableTask(task));
+  if (quarantined.length > 0) {
+    // Kept, not dropped — but still worth saying, because they are inert and
+    // the user is presumably wondering where their task went.
+    process.emitWarning(
+      `Ignoring ${quarantined.length} malformed task(s) in ${registryPath()}.`
+      + ` They stay in the file but will not run; fix or delete them by hand.`,
+    );
+  }
+  return { version: REGISTRY_VERSION, tasks, quarantined };
 }
 
 export function writeRegistry(registry: Registry): void {
+  // Quarantined entries go back verbatim and last, so a write triggered by an
+  // unrelated `add` is not what finally destroys them.
+  const tasks = [...registry.tasks, ...(registry.quarantined ?? [])];
   writePrivateAtomic(
     registryPath(),
-    `${JSON.stringify({ version: REGISTRY_VERSION, tasks: registry.tasks }, undefined, 2)}\n`,
+    `${JSON.stringify({ version: REGISTRY_VERSION, tasks }, undefined, 2)}\n`,
   );
 }
 
@@ -498,51 +556,107 @@ export function appendRun(taskId: string, record: RunRecord): void {  const trim
   }
 }
 
+/**
+ * Structural check for a history line.
+ *
+ * This validates every optional field a caller dereferences, not just the
+ * required ones: `runs` does `record.error.split("\n")`, so a line carrying
+ * `"error": 42` would pass a shallower check and then throw a TypeError that
+ * takes down the whole command — the same "one bad line poisons the history"
+ * failure the parse guard above prevents, one layer up.
+ */
+function isRunRecord(value: unknown): value is RunRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<RunRecord>;
+  if (
+    typeof record.runId !== "string"
+    || !Number.isFinite(record.startedAt)
+    || !Number.isFinite(record.endedAt)
+    || !RUN_STATUSES.includes(record.status as RunStatus)
+  ) {
+    return false;
+  }
+  if (record.error !== undefined && typeof record.error !== "string") return false;
+  if (record.output !== undefined && typeof record.output !== "string") return false;
+  if (record.exitCode !== undefined && !Number.isInteger(record.exitCode)) return false;
+  if (record.scheduledFor !== undefined && !Number.isFinite(record.scheduledFor)) return false;
+  return true;
+}
+
 export function readRuns(taskId: string, limit = 20): RunRecord[] {
   let raw: string;
   try {
     raw = readFileSync(runsPath(taskId), "utf8");
-  } catch {
-    return [];
+  } catch (error) {
+    // No history yet is normal. A log that exists but cannot be read is not,
+    // and returning [] there would let compaction rewrite it as empty.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
   }
+  const lines = raw.split("\n");
   const records: RunRecord[] = [];
-  for (const line of raw.split("\n")) {
+  for (const [index, line] of lines.entries()) {
     if (!line.trim()) continue;
+    let parsed: unknown;
     try {
-      records.push(JSON.parse(line) as RunRecord);
+      parsed = JSON.parse(line);
     } catch {
-      // A partially written final line is expected after a crash; skip it.
+      // A torn final line is expected after a crash — but that crashed run is
+      // usually the one being investigated, so it is still worth naming.
+      process.emitWarning(
+        index < lines.length - 1
+          ? `Skipping unparseable run record in ${runsPath(taskId)} line ${index + 1}`
+          : `Skipping the last run record in ${runsPath(taskId)}; likely truncated by a crash`,
+      );
+      continue;
     }
+    if (!isRunRecord(parsed)) {
+      process.emitWarning(`Skipping malformed run record in ${runsPath(taskId)} line ${index + 1}`);
+      continue;
+    }
+    records.push(parsed);
   }
   return records.slice(-limit);
 }
 
-export function forgetRuns(taskId: string): void {
+/** Returns false if a log existed and could not be removed. */
+export function forgetRuns(taskId: string): boolean {
   try {
     unlinkSync(runsPath(taskId));
-  } catch {
-    // Nothing recorded yet.
+    return true;
+  } catch (error) {
+    // Nothing recorded yet is the common case and not a failure.
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
   }
 }
 
-/** Drop history for tasks that no longer exist, so the directory does not creep. */
-export function pruneRuns(tasks: DurableTask[]): number {
+/**
+ * Drop history for tasks that no longer exist, so the directory does not creep.
+ *
+ * Returns the failures as well as the count: a caller that reports "removed 0"
+ * over logs it could not delete is telling the user their private prompts and
+ * outputs are gone when they are still on disk.
+ */
+export function pruneRuns(tasks: DurableTask[]): { removed: number; failed: string[] } {
   const live = new Set(tasks.map((task) => task.id));
   let entries: string[];
   try {
     entries = readdirSync(join(schedulerDir(), "runs"));
-  } catch {
-    return 0;
+  } catch (error) {
+    // Nothing recorded yet is the normal case. A runs/ that exists but cannot
+    // be listed is not, and "removed 0" would read as "nothing to do".
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { removed: 0, failed: [] };
+    throw error;
   }
   let removed = 0;
+  const failed: string[] = [];
   for (const entry of entries) {
-    const id = entry.replace(/\.jsonl$/, "");
-    if (id !== entry && !live.has(id)) {
-      forgetRuns(id);
-      removed += 1;
-    }
+    const id = entry.endsWith(".jsonl") ? entry.slice(0, -".jsonl".length) : undefined;
+    if (id === undefined || live.has(id)) continue;
+    if (forgetRuns(id)) removed += 1;
+    else failed.push(id);
   }
-  return removed;
+  return { removed, failed };
 }
 
 export function truncate(value: string, max: number): string {

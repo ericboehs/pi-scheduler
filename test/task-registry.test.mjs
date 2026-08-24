@@ -59,6 +59,35 @@ test("an absent registry reads as empty rather than throwing", (t) => {
   assert.deepEqual(readRegistry(), { version: 1, tasks: [] });
 });
 
+test("a corrupt registry refuses to read, so the next write cannot overwrite it", (t) => {
+  const dir = withTempDir(t);
+  const path = join(dir, "tasks.json");
+  writeFileSync(path, "{ this is not json");
+
+  // Reading it as empty was the old behaviour, and it lost data: the next
+  // `add` would happily write a one-task registry over a file that might have
+  // held twenty perfectly good ones.
+  assert.throws(() => readRegistry(), /Cannot read/);
+  assert.throws(() => withRegistry(() => {}), /Cannot read/);
+  assert.equal(readFileSync(path, "utf8"), "{ this is not json", "the bad file is left alone");
+});
+
+test("a registry from a future version is refused rather than silently emptied", (t) => {
+  const dir = withTempDir(t);
+  writeFileSync(join(dir, "tasks.json"), JSON.stringify({ version: 99, tasks: [task()] }));
+  assert.throws(() => readRegistry(), /version 99/);
+});
+
+test("an unreadable registry is an error, not an empty one", (t) => {
+  const dir = withTempDir(t);
+  const path = join(dir, "tasks.json");
+  writeFileSync(path, JSON.stringify({ version: 1, tasks: [task()] }));
+  chmodSync(path, 0o000);
+  // root ignores the mode, so this can only be asserted as an unprivileged user.
+  if (process.getuid?.() === 0) return;
+  assert.throws(() => readRegistry(), /Cannot read/);
+});
+
 test("a malformed task is dropped without discarding its healthy neighbours", (t) => {
   const dir = withTempDir(t);
   writeFileSync(join(dir, "tasks.json"), JSON.stringify({
@@ -84,6 +113,18 @@ test("validation matches each kind against the field it actually needs", () => {
   assert.equal(isDurableTask(task({ kind: "cron", cronExpr: "@daily" })), true);
   assert.equal(isDurableTask(task({ kind: "once", dailyAt: undefined })), true);
   assert.equal(isDurableTask(task({ prompt: "   " })), false, "an empty prompt is not a task");
+  assert.equal(isDurableTask(task({ timeoutMs: 0 })), false, "a zero timeout kills every run instantly");
+  assert.equal(isDurableTask(task({ misfire: -1 })), false);
+  assert.equal(isDurableTask(task({ misfire: Number.NaN })), false);
+  assert.equal(isDurableTask(task({ misfire: "always" })), true);
+  assert.equal(isDurableTask(task({ misfire: "soon" })), false);
+  assert.equal(isDurableTask(task({ nextRunAt: Number.NaN })), false);
+  assert.equal(
+    isDurableTask(task({ runningSince: Date.now() })),
+    false,
+    "half a claim is a torn write, not an owned run",
+  );
+  assert.equal(isDurableTask(task({ runningSince: Date.now(), runnerPid: 42 })), true);
   assert.equal(isDurableTask(null), false);
 });
 
@@ -277,6 +318,48 @@ test("the claim holder settles normally", (t) => {
   assert.equal(stored.lastStatus, "ok");
 });
 
+test("a malformed history line is skipped rather than trusted as a record", (t) => {
+  const dir = withTempDir(t);
+  mkdirSync(join(dir, "runs"), { recursive: true });
+  writeFileSync(join(dir, "runs", "abc.jsonl"), [
+    JSON.stringify({ runId: "1", startedAt: 1, endedAt: 2, status: "ok" }),
+    JSON.stringify({ runId: "2", startedAt: "yesterday", endedAt: 2, status: "ok" }),
+    JSON.stringify({ runId: "3", startedAt: 1, endedAt: 2, status: "probably fine" }),
+    JSON.stringify({ runId: "4", startedAt: 3, endedAt: 4, status: "error" }),
+    "",
+  ].join("\n"));
+
+  assert.deepEqual(readRuns("abc").map((entry) => entry.runId), ["1", "4"]);
+});
+
+test("a run log that cannot be read is an error, not an empty history", (t) => {
+  const dir = withTempDir(t);
+  mkdirSync(join(dir, "runs"), { recursive: true });
+  const path = join(dir, "runs", "abc.jsonl");
+  writeFileSync(path, `${JSON.stringify({ runId: "1", startedAt: 1, endedAt: 2, status: "ok" })}\n`);
+  chmodSync(path, 0o000);
+  if (process.getuid?.() === 0) return;
+
+  // Returning [] here used to let compaction rewrite the log as empty.
+  assert.throws(() => readRuns("abc"));
+});
+
+test("prune only counts logs it actually removed", (t) => {
+  const dir = withTempDir(t);
+  appendRun("gone1", { runId: "1", startedAt: 1, endedAt: 2, status: "ok" });
+  appendRun("gone2", { runId: "1", startedAt: 1, endedAt: 2, status: "ok" });
+  chmodSync(join(dir, "runs"), 0o500);
+  if (process.getuid?.() === 0) return;
+
+  try {
+    // Reporting removals that did not happen is worse than reporting none, and
+    // the caller needs the ids to tell the user what is still on disk.
+    assert.deepEqual(pruneRuns([]), { removed: 0, failed: ["gone1", "gone2"] });
+  } finally {
+    chmodSync(join(dir, "runs"), 0o700);
+  }
+});
+
 test("removing a task can take its history with it", (t) => {
   withTempDir(t);
   appendRun("abc", { runId: "1", startedAt: 1, endedAt: 2, status: "ok" });
@@ -290,7 +373,7 @@ test("prune drops history for tasks that no longer exist", (t) => {
   appendRun("alive123", { runId: "1", startedAt: 1, endedAt: 2, status: "ok" });
   appendRun("dead4567", { runId: "1", startedAt: 1, endedAt: 2, status: "ok" });
 
-  assert.equal(pruneRuns([task({ id: "alive123" })]), 1);
+  assert.deepEqual(pruneRuns([task({ id: "alive123" })]), { removed: 1, failed: [] });
   assert.equal(readRuns("alive123").length, 1);
   assert.deepEqual(readRuns("dead4567"), []);
 });
@@ -336,6 +419,35 @@ test("a history write failure on a recurring task still releases and advances it
   assert.ok(stored.nextRunAt > Date.now());
 });
 
+test("a malformed task is quarantined, not scheduled and not destroyed", (t) => {
+  const dir = withTempDir(t);
+  const junk = { id: "junk", kind: "weekly", prompt: "x", createdAt: 0, nextRunAt: 0 };
+  writeFileSync(join(dir, "tasks.json"), JSON.stringify({
+    version: 1,
+    tasks: [task(), junk],
+  }));
+
+  const warnings = [];
+  const listener = (warning) => warnings.push(warning.message);
+  process.on("warning", listener);
+  t.after(() => process.removeListener("warning", listener));
+
+  const registry = readRegistry();
+  assert.equal(registry.tasks.length, 1, "the bad entry is not schedulable");
+  assert.deepEqual(registry.quarantined, [junk]);
+
+  // The whole point: an unrelated write must not be what deletes it.
+  writeRegistry({ ...registry, tasks: [...registry.tasks, task({ id: "cccc3333" })] });
+  const onDisk = JSON.parse(readFileSync(join(dir, "tasks.json"), "utf8"));
+  assert.equal(onDisk.tasks.length, 3);
+  assert.deepEqual(onDisk.tasks.at(-1), junk, "still there, verbatim, after a write");
+
+  return new Promise((resolve) => setImmediate(() => {
+    assert.ok(warnings.some((message) => /Ignoring 1 malformed task/.test(message)), warnings.join("\n"));
+    resolve();
+  }));
+});
+
 test("a claim records the machine that made it", () => {
   const claimed = claimTask(task(), 1_000, 4242);
   assert.equal(claimed.runnerHost, hostname());
@@ -369,3 +481,9 @@ test("a claim with no host is still probed, so upgrades keep working", () => {
   assert.equal(isClaimStale(legacy, Date.now()), true, "pid 2 is not a live runner here");
 });
 
+test("a claim carrying an unknown host is valid, not quarantined", () => {
+  // An older version reading a newer registry must not treat the extra field
+  // as corruption and park the task.
+  assert.equal(isDurableTask({ ...task(), runningSince: 1, runnerPid: 2, runnerHost: "other" }), true);
+  assert.equal(isDurableTask({ ...task(), runningSince: 1, runnerPid: 2, runnerHost: 7 }), false);
+});

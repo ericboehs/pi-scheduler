@@ -378,8 +378,15 @@ function commandRuns(selector, limit) {
 }
 
 function commandPrune() {
-  const removed = pruneRuns(readRegistry().tasks);
+  const { removed, failed } = pruneRuns(readRegistry().tasks);
   process.stdout.write(`Removed ${removed} orphaned run log(s)\n`);
+  if (failed.length > 0) {
+    // "Removed 0" over history that is still on disk is the wrong answer.
+    process.stderr.write(
+      `pi-scheduler: could not delete ${failed.length} run log(s): ${failed.join(", ")}\n`,
+    );
+    process.exitCode = 1;
+  }
 }
 
 function commandAdd(rest, flags) {
@@ -486,8 +493,16 @@ function commandRemove(selector) {
     const task = findTask(registry.tasks, selector);
     registry.tasks = registry.tasks.filter((candidate) => candidate.id !== task.id);
     writeRegistry(registry);
-    forgetRuns(task.id);
+    // Run history is private data. Saying "Removed" while the prompts and
+    // outputs are still on disk is the one wrong answer here.
+    const forgotten = forgetRuns(task.id);
     process.stdout.write(`Removed ${task.name ?? task.id}\n`);
+    if (!forgotten) {
+      process.stderr.write(
+        `pi-scheduler: could not delete the run history for ${task.id}; it is still in ${schedulerDir()}/runs\n`,
+      );
+      process.exitCode = 1;
+    }
   });
 }
 
