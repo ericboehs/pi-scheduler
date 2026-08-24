@@ -607,10 +607,46 @@ function commandRemove(selector) {
 }
 
 /**
- * launchd and systemd both start jobs with a bare environment, so the PATH the
- * task's own `deliver` command and any tools will see is captured at install
- * time rather than inherited. Reinstall after moving node, pi or mise.
+ * Environment the service must carry.
+ *
+ * PATH because launchd and systemd start jobs with a bare environment, so what
+ * the task's own `deliver` command and any tools see is captured at install
+ * time rather than inherited. PI_SCHEDULER_DIR / PI_AGENT_DIR because a
+ * service pointed at the default registry while you were using a different one
+ * looks exactly like a scheduler that silently does nothing.
+ *
+ * Reinstall after moving node, pi or mise, or after changing these.
  */
+function serviceEnv() {
+  const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: homedir() };
+  if (process.env.PI_SCHEDULER_DIR) env.PI_SCHEDULER_DIR = process.env.PI_SCHEDULER_DIR;
+  if (process.env.PI_AGENT_DIR) env.PI_AGENT_DIR = process.env.PI_AGENT_DIR;
+  return env;
+}
+
+/**
+ * An `Environment=` assignment as systemd documents it.
+ *
+ * The quotes go around the whole `KEY=value`, which is the form in
+ * systemd.exec(5). Quoting only the value works in practice — the parser
+ * recognises quotes mid-word, which is why `Environment=JAVA_OPTS="-Xms1g
+ * -Xmx1g"` is everywhere — but that is undocumented behaviour to lean on for
+ * something that fails silently. Unquoted, systemd splits on whitespace and
+ * reads `%` as a specifier, so a path under "Application Support" would arrive
+ * truncated at the space — the service would then read a registry at
+ * "/Users/x/Library/Application", which is not the default and not anything
+ * else either.
+ */
+function systemdEnvironment(key, value) {
+  const assignment = `${key}=${value}`.replace(/[\\"]/g, "\\$&").replace(/%/g, "%%");
+  return `Environment="${assignment}"`;
+}
+
+/** XML-escape a value going into the plist; a path may legitimately contain &. */
+function plistEscape(value) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function checkNodeVersion() {
   const actual = process.versions.node.split(".").map(Number);
   for (let index = 0; index < MIN_NODE.length; index += 1) {
@@ -641,10 +677,9 @@ function installLaunchd(logPath) {
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key>
-    <string>${process.env.PATH ?? "/usr/bin:/bin"}</string>
-    <key>HOME</key>
-    <string>${homedir()}</string>
+${Object.entries(serviceEnv())
+  .map(([key, value]) => `    <key>${key}</key>\n    <string>${plistEscape(value)}</string>`)
+  .join("\n")}
   </dict>
   <key>StartInterval</key>
   <integer>60</integer>
@@ -671,16 +706,21 @@ function installLaunchd(logPath) {
 
 function installSystemd() {
   mkdirSync(SYSTEMD_DIR, { recursive: true });
+  const environment = Object.entries(serviceEnv())
+    .map(([key, value]) => systemdEnvironment(key, value))
+    .join("\n");
   writeFileSync(join(SYSTEMD_DIR, `${SYSTEMD_UNIT}.service`), `[Unit]
 Description=Run due pi scheduled tasks
 
 [Service]
 Type=oneshot
-Environment=PATH=${process.env.PATH ?? "/usr/bin:/bin"}
+${environment}
 ExecStart=${NODE} ${SELF} check
 `);
-  // Persistent=true is the systemd equivalent of launchd firing after wake:
-  // a laptop that was suspended over the scheduled minute still gets its tick.
+  // No catch-up on this timer, by design. Persistent= only applies to
+  // OnCalendar=, and a monotonic OnUnitActiveSec= timer simply resumes its
+  // interval after a suspend. Catching up a missed slot is the misfire
+  // policy's job instead, which is what makes it work identically on launchd.
   writeFileSync(join(SYSTEMD_DIR, `${SYSTEMD_UNIT}.timer`), `[Unit]
 Description=Check for due pi scheduled tasks every minute
 
@@ -688,7 +728,6 @@ Description=Check for due pi scheduled tasks every minute
 OnBootSec=1min
 OnUnitActiveSec=1min
 AccuracySec=15s
-Persistent=true
 
 [Install]
 WantedBy=timers.target
@@ -696,11 +735,13 @@ WantedBy=timers.target
 
   const reload = spawnSync("systemctl", ["--user", "daemon-reload"], { encoding: "utf8" });
   if (reload.error) die(`systemctl not found: ${reload.error.message}`);
+  if (reload.status !== 0) die(`systemctl daemon-reload failed: ${reload.stderr?.trim()}`);
   const enable = spawnSync(
     "systemctl",
     ["--user", "enable", "--now", `${SYSTEMD_UNIT}.timer`],
     { encoding: "utf8" },
   );
+  if (enable.error) die(`systemctl not found: ${enable.error.message}`);
   if (enable.status !== 0) die(`systemctl enable failed: ${enable.stderr?.trim()}`);
   process.stdout.write(
     `Installed ${SYSTEMD_UNIT}.timer via systemd --user; logs in journalctl --user -u ${SYSTEMD_UNIT}\n`
@@ -721,25 +762,57 @@ function commandInstall() {
 }
 
 function commandUninstall() {
+  // Report what actually failed. "Removed the scheduler tick" over a unit that
+  // is still firing every minute is the worst possible answer here.
+  const problems = [];
+  const forget = (path) => {
+    try {
+      unlinkSync(path);
+    } catch (error) {
+      if (error.code !== "ENOENT") problems.push(`could not remove ${path}: ${error.code ?? error.message}`);
+    }
+  };
+
   if (process.platform === "darwin") {
     const domain = `gui/${process.getuid?.() ?? ""}`;
-    spawnSync("launchctl", ["bootout", `${domain}/${LABEL}`], { stdio: "ignore" });
-    try {
-      unlinkSync(PLIST);
-    } catch {
-      // Already gone.
+    const bootout = spawnSync("launchctl", ["bootout", `${domain}/${LABEL}`], { encoding: "utf8" });
+    if (bootout.error) problems.push(`launchctl not found: ${bootout.error.message}`);
+    // 3 / NOTHING FOUND just means it was not loaded, which is the goal anyway.
+    else if (bootout.status !== 0 && bootout.status !== 3) {
+      problems.push(`launchctl bootout failed: ${bootout.stderr?.trim() || bootout.status}`);
     }
+    // Only once the job is actually unloaded. A plist deleted out from under a
+    // live job leaves it firing every minute, and the config needed to retry
+    // the uninstall or work out why it failed is gone with it.
+    if (problems.length === 0) forget(PLIST);
   } else if (process.platform === "linux") {
-    spawnSync("systemctl", ["--user", "disable", "--now", `${SYSTEMD_UNIT}.timer`], { stdio: "ignore" });
-    for (const suffix of ["timer", "service"]) {
-      try {
-        unlinkSync(join(SYSTEMD_DIR, `${SYSTEMD_UNIT}.${suffix}`));
-      } catch {
-        // Already gone.
+    const disable = spawnSync(
+      "systemctl",
+      ["--user", "disable", "--now", `${SYSTEMD_UNIT}.timer`],
+      { encoding: "utf8" },
+    );
+    if (disable.error) problems.push(`systemctl not found: ${disable.error.message}`);
+    // Exit 1 with "does not exist" just means it was never installed, which is
+    // the goal. Anything else and the timer may still be armed — keep the unit
+    // files so the uninstall can be retried and the failure diagnosed, rather
+    // than leaving a running timer with its definition deleted.
+    else if (disable.status !== 0 && !/not (?:loaded|found)|does not exist|No such file/i.test(disable.stderr ?? "")) {
+      problems.push(`systemctl disable failed: ${disable.stderr?.trim() || disable.status}`);
+    }
+
+    if (problems.length === 0) {
+      for (const suffix of ["timer", "service"]) forget(join(SYSTEMD_DIR, `${SYSTEMD_UNIT}.${suffix}`));
+      const reload = spawnSync("systemctl", ["--user", "daemon-reload"], { encoding: "utf8" });
+      if (reload.error) problems.push(`systemctl not found: ${reload.error.message}`);
+      else if (reload.status !== 0) {
+        problems.push(`systemctl daemon-reload failed: ${reload.stderr?.trim()}`);
       }
     }
-    spawnSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
+  } else {
+    die(`no scheduler integration for ${process.platform}; nothing was installed to remove`);
   }
+
+  if (problems.length > 0) die(problems.join("\n"));
   process.stdout.write(`Removed the scheduler tick; tasks are kept in ${schedulerDir()}\n`);
 }
 
