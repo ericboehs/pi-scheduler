@@ -1,0 +1,45 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both platforms matter: install writes a launchd job on macOS and a
+        # systemd --user timer on Linux, and the CLI imports the extensions'
+        # .ts modules under Node's strip-only mode, which is stricter than the
+        # transpile pi itself uses.
+        os: [ubuntu-latest, macos-latest]
+        node: ['22.18', '24', '26']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Test
+        run: node --test test/*.test.mjs
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # pi is a peerDependency: it supplies the ExtensionContext types the
+      # extensions import. Nothing is bundled, so CI installs it just to typecheck.
+      - name: Install typecheck deps
+        run: npm install --no-save typescript@5 @earendil-works/pi-coding-agent
+
+      - name: Typecheck
+        run: npx tsc -p tsconfig.json
