@@ -97,6 +97,15 @@ function capture(
       resolve({ code, signal, stdout, stderr, timedOut });
     });
 
+    // A child that exits, or never reads stdin, makes this write fail with
+    // EPIPE. An unhandled 'error' on the stream would take down the whole
+    // process — for the tick, that means one misbehaving task killing the run
+    // of every other due task. The child's exit code is the real signal, and
+    // 'close' below still resolves with it, so this is deliberately swallowed.
+    // `deliver` commands hit the same path: plenty of shell one-liners never
+    // read their stdin.
+    child.stdin.on("error", () => {});
+
     if (options.input !== undefined) child.stdin.end(options.input);
     else child.stdin.end();
   });

@@ -576,3 +576,34 @@ test("help is informational, while misuse is a warning", async (t) => {
   await ui.run("");
   assert.equal(ui.last().level, "warning");
 });
+
+test("a child that never reads stdin fails the run instead of crashing the tick", async (t) => {
+  const dir = withTempDir(t);
+  const { runTask } = await import("../extensions/lib/runner.ts");
+
+  // node rejects the pi flags immediately and exits, closing the read end of
+  // the pipe while the prompt is still being written. A prompt far larger than
+  // a pipe buffer makes that race deterministic rather than occasional, which
+  // is why this only ever failed on Linux CI and never on macOS.
+  const previous = process.env.PI_SCHEDULER_PI_BIN;
+  process.env.PI_SCHEDULER_PI_BIN = process.execPath;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_SCHEDULER_PI_BIN;
+    else process.env.PI_SCHEDULER_PI_BIN = previous;
+  });
+
+  const task = {
+    id: "epipe01",
+    name: "epipe",
+    prompt: "x".repeat(1_000_000),
+    kind: "daily",
+    cwd: dir,
+    createdAt: Date.now(),
+    nextRunAt: Date.now(),
+  };
+
+  // The point is that this resolves at all: an unhandled EPIPE on child.stdin
+  // would take the process down and every other due task with it.
+  const outcome = await runTask(task, { timeoutMs: 30_000 });
+  assert.equal(outcome.status, "error", "a child that exits nonzero is a failed run");
+});

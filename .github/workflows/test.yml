@@ -39,7 +39,7 @@ jobs:
       # pi is a peerDependency: it supplies the ExtensionContext types the
       # extensions import. Nothing is bundled, so CI installs it just to typecheck.
       - name: Install typecheck deps
-        run: npm install --no-save typescript@5 @earendil-works/pi-coding-agent
+        run: npm install --no-save typescript@5 @types/node @earendil-works/pi-coding-agent
 
       - name: Typecheck
         run: npx tsc -p tsconfig.json
