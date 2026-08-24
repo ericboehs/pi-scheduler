@@ -485,18 +485,34 @@ function commandSetPaused(selector, paused) {
       return;
     }
     const lines = [];
+    const expired = [];
     for (const existing of targets) {
       const index = registry.tasks.indexOf(existing);
       const task = { ...existing, paused };
-      // Resuming a task whose slot passed while it slept should not fire a burst.
+      // Resuming a task whose slot passed while it slept should not fire a
+      // burst. A one-shot has no later occurrence at all, so firstRunAfter
+      // returns undefined: keeping the stale nextRunAt would fire (or skip) it
+      // the moment the next tick runs. Leave it paused and say why.
       if (!paused && task.nextRunAt <= Date.now()) {
-        task.nextRunAt = firstRunAfter(task) ?? task.nextRunAt;
+        const next = firstRunAfter(task);
+        if (next === undefined) {
+          expired.push(existing);
+          continue;
+        }
+        task.nextRunAt = next;
       }
       registry.tasks[index] = task;
       lines.push(formatTask(task));
     }
     writeRegistry(registry);
+    for (const task of expired) {
+      lines.push(
+        `${task.name ?? task.id}: its one-shot time has passed, so it stays paused.`
+        + ` Give it a new time with --schedule, or remove it.`,
+      );
+    }
     process.stdout.write(`${lines.join("\n")}\n`);
+    if (expired.length > 0) process.exitCode = 1;
   });
 }
 

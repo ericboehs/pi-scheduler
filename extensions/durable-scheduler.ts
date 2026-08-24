@@ -466,20 +466,35 @@ export default function durableScheduler(pi: ExtensionAPI): void {
               notice(ctx, `Nothing to ${paused ? "pause" : "resume"}`);
               return;
             }
+            const expired: typeof targets = [];
             for (const existing of targets) {
               const index = registry.tasks.indexOf(existing);
               const task = { ...existing, paused };
-              // Resuming must not replay slots missed while paused.
+              // Resuming must not replay slots missed while paused. A one-shot
+              // has no later occurrence, so firstRunAfter returns undefined:
+              // leaving its stale nextRunAt would fire (or skip) it instantly.
+              // Keep it paused instead and say so, rather than deciding for you.
               if (!paused && task.nextRunAt <= Date.now()) {
-                task.nextRunAt = firstRunAfter(task) ?? task.nextRunAt;
+                const next = firstRunAfter(task);
+                if (next === undefined) {
+                  expired.push(existing);
+                  continue;
+                }
+                task.nextRunAt = next;
               }
               registry.tasks[index] = task;
             }
             writeRegistry(registry);
-            notice(ctx, registry.tasks
+            const lines = registry.tasks
               .filter((task) => targets.some((target) => target.id === task.id))
-              .map((task) => formatTask(task))
-              .join("\n"));
+              .map((task) => formatTask(task));
+            for (const task of expired) {
+              lines.push(
+                `${task.name ?? task.id}: its one-shot time has passed, so it stays paused.`
+                + ` Give it a new time, or remove it.`,
+              );
+            }
+            notice(ctx, lines.join("\n"), expired.length > 0 ? "warning" : "info");
           });
           return;
         }
