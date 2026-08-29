@@ -11,6 +11,8 @@
   "engines": { "node": ">=22.18.0" },
   "scripts": { "test": "node --test test/*.test.mjs" },
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "//peerDependenciesMeta": "Optional so pi's git installer, which runs a plain `npm install` in the clone, does not pull a 140MB copy of pi in behind it. Nothing here imports pi at runtime; the peer only records which API the extensions are typed against, and CI installs it explicitly to typecheck.",
+  "peerDependenciesMeta": { "@earendil-works/pi-coding-agent": { "optional": true } },
   "pi": {
     "//": "Explicit glob, not the extensions/ convention: lib/ holds shared modules that are imported, not loaded as extensions.",
     "extensions": ["extensions/*.ts"]
